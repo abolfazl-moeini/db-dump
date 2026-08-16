@@ -99,18 +99,38 @@ function isUserDumpName(string $name): bool
 
 function stripDefiner(string $sql): string
 {
-    return preg_replace('/\s*DEFINER\s*=\s*`[^`]+`@`[^`]+`/i', '', $sql) ?? $sql;
+    $cleaned = preg_replace('/\s*DEFINER\s*=\s*(?:`[^`]+`|[\w\-\.]+)\s*@\s*(?:`[^`]+`|[\w\-\.%]+)/i', '', $sql);
+    return $cleaned ?? $sql;
+}
+
+function shouldSkipImportSql(string $sql): bool
+{
+    $trimmed = trim($sql);
+    if ($trimmed === '') {
+        return true;
+    }
+    // Skip binary log & GTID replication statements that require SUPER / BINLOG ADMIN privileges
+    if (preg_match('/^SET\s+(?:@@SESSION\.|@@GLOBAL\.|@)?[A-Za-z0-9_]*SQL_LOG_BIN/i', $trimmed)
+        || preg_match('/^SET\s+@MYSQLDUMP_TEMP_LOG_BIN/i', $trimmed)
+        || preg_match('/^SET\s+@@GLOBAL\.GTID_PURGED/i', $trimmed)) {
+        return true;
+    }
+    return false;
 }
 
 function looksLikeSqlErrorIgnorable(string $err, string $sql = ''): bool
 {
-    if (!preg_match('/unknown table|unknown view|does(?:n\'t| not) exist/i', $err)) {
-        return false;
+    if (preg_match('/unknown table|unknown view|does(?:n\'t| not) exist/i', $err)) {
+        return (bool) preg_match(
+            '/^\s*DROP\s+(?:TABLE|VIEW|TRIGGER|PROCEDURE|FUNCTION|EVENT)\s+IF\s+EXISTS\b/i',
+            $sql
+        );
     }
-    return (bool) preg_match(
-        '/^\s*DROP\s+(?:TABLE|VIEW|TRIGGER|PROCEDURE|FUNCTION|EVENT)\s+IF\s+EXISTS\b/i',
-        $sql
-    );
+    // Ignore SUPER/BINLOG ADMIN privilege errors on SET statements
+    if (preg_match('/SUPER|BINLOG ADMIN/i', $err) && preg_match('/^\s*SET\s+/i', $sql)) {
+        return true;
+    }
+    return false;
 }
 
 /**
@@ -643,6 +663,13 @@ function runSelfTests(): int
     $assert($sr->replace('s:3:"old') === 's:3:"old', 'do not str_replace truncated serialized data');
     $mixed = serialize('old') . ' old';
     $assert($sr->replace($mixed) === $mixed, 'do not str_replace if serialized parse is incomplete');
+
+    $assert(shouldSkipImportSql('SET @@SESSION.SQL_LOG_BIN= 0'), 'skip SET SQL_LOG_BIN');
+    $assert(shouldSkipImportSql('SET @@GLOBAL.GTID_PURGED=/*!80000 \'+\'*/ \'\''), 'skip SET GTID_PURGED');
+    $assert(shouldSkipImportSql('SET @MYSQLDUMP_TEMP_LOG_BIN = @@SESSION.SQL_LOG_BIN'), 'skip SET MYSQLDUMP_TEMP_LOG_BIN');
+    $assert(!shouldSkipImportSql('SET FOREIGN_KEY_CHECKS=0'), 'do not skip SET FOREIGN_KEY_CHECKS');
+    $assert(looksLikeSqlErrorIgnorable('Access denied; you need SUPER, BINLOG ADMIN privilege(s)', 'SET @@SESSION.SQL_LOG_BIN= 0'), 'ignore SUPER error on SET');
+    $assert(stripDefiner('CREATE DEFINER=`root`@`localhost` VIEW `v` AS SELECT 1') === 'CREATE VIEW `v` AS SELECT 1', 'stripDefiner on view');
 
     echo "\n{$ok} passed, {$fail} failed\n";
     return $fail === 0 ? 0 : 1;
@@ -1760,6 +1787,15 @@ class DatabaseImporter
 
     private function execImportSql(string $sql, array &$state): void
     {
+        $sql = trim($sql);
+        if ($sql === '' || shouldSkipImportSql($sql)) {
+            return;
+        }
+
+        if (preg_match('/^\s*CREATE\s+/i', $sql)) {
+            $sql = stripDefiner($sql);
+        }
+
         if (($state['search_old'] ?? '') !== '' && ($state['search_new'] ?? '') !== '' && empty($state['wp_search_replace'])) {
             $sql = str_replace($state['search_old'], $state['search_new'], $sql);
         }
