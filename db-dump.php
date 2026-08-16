@@ -1672,6 +1672,35 @@ class DatabaseImporter
         $src = $this->config['export_dir'] . $state['source_name'];
         $name = $state['source_name'];
 
+        if (preg_match('/\.sql$/i', $name)) {
+            $state['file_name'] = $name;
+            $state['file_size'] = (int) (filesize($src) ?: 0);
+            $state['phase'] = 'importing';
+            return $state;
+        }
+
+        $srcMtime = is_file($src) ? (int) filemtime($src) : 0;
+        $srcSize = is_file($src) ? (int) filesize($src) : 0;
+        $destName = 'import_work.sql';
+        $dest = $this->config['export_dir'] . $destName;
+        $metaPath = $dest . '.meta';
+
+        // Check if import_work.sql is already decompressed and matches the source file
+        if (is_file($dest) && is_file($metaPath)) {
+            $meta = json_decode((string) file_get_contents($metaPath), true);
+            if (is_array($meta)
+                && ($meta['src'] ?? '') === $name
+                && ($meta['mtime'] ?? 0) === $srcMtime
+                && ($meta['size'] ?? 0) === $srcSize
+                && (int) filesize($dest) > 0) {
+                // Reusing cached extracted SQL file without repeating decompression
+                $state['file_name'] = $destName;
+                $state['file_size'] = (int) filesize($dest);
+                $state['phase'] = 'importing';
+                return $state;
+            }
+        }
+
         if (preg_match('/\.zip$/i', $name)) {
             if (!class_exists('ZipArchive')) {
                 throw new RuntimeException('ZipArchive is not available. Upload a .sql or .sql.gz file.');
@@ -1704,8 +1733,6 @@ class DatabaseImporter
                 $zip->close();
                 throw new RuntimeException('Could not read SQL file inside ZIP.');
             }
-            $destName = 'import_work.sql';
-            $dest = $this->config['export_dir'] . $destName;
             $out = fopen($dest, 'wb');
             if ($out === false) {
                 fclose($stream);
@@ -1723,8 +1750,16 @@ class DatabaseImporter
             fclose($out);
             fclose($stream);
             $zip->close();
+
+            file_put_contents($metaPath, json_encode([
+                'src'   => $name,
+                'mtime' => $srcMtime,
+                'size'  => $srcSize,
+            ]), LOCK_EX);
+            @chmod($metaPath, 0640);
+
             $state['file_name'] = $destName;
-            $state['file_size'] = filesize($dest) ?: 0;
+            $state['file_size'] = (int) filesize($dest) ?: 0;
             $state['phase'] = 'importing';
             return $state;
         }
@@ -1733,8 +1768,6 @@ class DatabaseImporter
             if (!function_exists('gzopen')) {
                 throw new RuntimeException('GZIP support is not available. Upload a .sql or .zip file.');
             }
-            $destName = 'import_work.sql';
-            $dest = $this->config['export_dir'] . $destName;
             $in = gzopen($src, 'rb');
             if ($in === false) {
                 throw new RuntimeException('Could not open gzip dump.');
@@ -1793,8 +1826,16 @@ class DatabaseImporter
             }
             fclose($out);
             gzclose($in);
+
+            file_put_contents($metaPath, json_encode([
+                'src'   => $name,
+                'mtime' => $srcMtime,
+                'size'  => $srcSize,
+            ]), LOCK_EX);
+            @chmod($metaPath, 0640);
+
             $state['file_name'] = $destName;
-            $state['file_size'] = filesize($dest) ?: 0;
+            $state['file_size'] = (int) filesize($dest) ?: 0;
             $state['phase'] = 'importing';
             return $state;
         }
