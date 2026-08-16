@@ -1,45 +1,84 @@
 # Database Dump & Restore Tool
 
-A lightweight, single-file PHP tool designed for **shared hosting**, **cPanel**, **DirectAdmin**, and **WordPress** to:
-1. **Import / Restore** large `.sql`, `.sql.gz` (GZIP), or `.zip` files in chunks without HTTP or PHP execution timeouts.
-2. **Export** selected database tables to compressed `.sql.gz` or `.sql`.
-3. **Copy** databases directly from one host to another.
-4. **Search & Replace** URLs/domains safely across WordPress serialized data (in `wp_options`, `wp_postmeta`, etc.).
+A single-file PHP tool for **shared hosting**, **cPanel**, **DirectAdmin**, and **WordPress**. It can:
+
+1. **Import / restore** large `.sql`, `.sql.gz`, or `.zip` dumps in short HTTP bursts so shared-host timeouts do not kill the job.
+2. **Export** selected tables to `.sql.gz` or `.sql` (plus views, triggers, routines, and events when available).
+3. **Copy** tables (and views) from the current database to another MySQL/MariaDB host.
+4. **Search & replace** URLs after import, including WordPress serialized data, without breaking string lengths.
+
+Requires **PHP 7.4+** with `mysqli`. GZIP import/export needs `zlib`. ZIP upload needs `zip`.
 
 ---
 
-## Features
+## Security (read this first)
 
-- **Chunked & Resumable Execution**: Works within 15–25 second HTTP request bursts, preventing server `504 Gateway Timeout` or `max_execution_time` kills on shared hosting.
-- **GZIP Streaming**: Reads and writes `.sql.gz` compressed archives on the fly without heavy memory usage.
-- **WordPress wp-config.php Auto-Detection**: Automatically detects database credentials if placed in your WordPress root or public directory.
-- **Domain Search & Replace**: Automatically updates domain URLs (e.g. `https://tavangarynew.local` -> `https://tavangary.com`) while preserving serialized PHP data length integrity.
-- **File Upload & Browser Manager**: Upload dump files directly from your browser or FTP them to `db_exports/`.
+This file can drop tables, rewrite a live database, and download dumps. Treat it as a temporary admin tool.
+
+- On first open it **refuses to run until you set a password** (stored as a hash in `db-dump-auth.php`).
+- Optional header auth: set env `DB_EXPORT_TOKEN` and send `X-Auth-Token`. There is no default token.
+- Optional hash via env: `DB_EXPORT_PASSWORD_HASH` (from `password_hash('...', PASSWORD_DEFAULT)`).
+- Dumps live in `db_exports/`. The tool writes `.htaccess`, `web.config`, and `index.php` deny files. **Nginx does not honor `.htaccess`** — deny `/db_exports/` in the server config, or only upload dumps through the tool and delete them after.
+- **Delete `db-dump.php`, `db-dump-auth.php`, and `db_exports/` when you are done.** The Files tab has a button that does this after you type `DELETE`.
+
+Do not leave this script on a public site after the migration.
 
 ---
 
-## How to Import a Localhost SQL Dump to Server
+## How to import a localhost dump on the server
 
-### Step 1: Export your Localhost Database
-1. You can use this tool on localhost (or WP-CLI `wp db export dump.sql.gz`) to generate a compressed backup file:
-   ```bash
-   wp db export dump.sql.gz
-   ```
+### 1. Export the local database
 
-### Step 2: Upload to Server
-1. Upload `db-dump.php` to your server (e.g. in `public_html/` or a secure subfolder).
-2. Upload your `dump.sql.gz` (or `dump.sql`) directly to the `db_exports/` directory on the server via FTP / cPanel File Manager (or use the web upload button in the tool).
+```bash
+wp db export dump.sql.gz
+```
 
-### Step 3: Run the Import
-1. Open `https://your-domain.com/db-dump.php` in your browser.
-2. Go to the **Import / Restore** tab.
-3. Select your uploaded dump file from the dropdown.
-4. (Optional) In the **Domain / URL Search & Replace** section:
-   - **Old URL**: `https://tavangarynew.local` (your local dev URL)
-   - **New URL**: `https://your-domain.com` (your live site URL)
-   - Keep "Safely update WordPress serialized strings" checked.
-5. Click **Start Database Import**.
-6. The progress bar will stream through the dump chunk-by-chunk until complete.
+Or use this tool on localhost (Export Dump tab).
 
-### Step 4: Cleanup
-- **IMPORTANT**: Delete `db-dump.php` and the `db_exports/` folder from your server once the import is finished for security!
+### 2. Upload to the server
+
+1. Upload `db-dump.php` (WordPress root is fine; it will read `wp-config.php`).
+2. Open `https://your-domain.com/db-dump.php` and set a password.
+3. Upload `dump.sql.gz` in the tool, or FTP it into `db_exports/`.
+
+### 3. Run the import
+
+1. Open the **Import / Restore** tab.
+2. Select the dump.
+3. Optional domain replace:
+   - Old URL: `http://localhost:8080`
+   - New URL: `https://your-domain.com`
+   - Keep **Safely update WordPress serialized strings** checked so `wp_options` / `wp_postmeta` stay valid.
+4. Click **Start Database Import** and leave the tab open until it finishes.
+
+If WordPress replace is checked, SQL is imported unchanged and replace runs afterward in its own chunked phase. That avoids corrupting serialized PHP by doing a naive `str_replace` on the dump.
+
+### 4. Cleanup
+
+Delete `db-dump.php`, `db-dump-auth.php`, and `db_exports/` (or use **Delete this tool and all dumps**).
+
+---
+
+## Credentials
+
+Resolved in this order: environment variables, then nearby `wp-config.php`, then `127.0.0.1`.
+
+| Variable | Purpose |
+|---|---|
+| `DB_HOST` / `WORDPRESS_DB_HOST` | Host, `host:port`, or `localhost:/path/mysql.sock` |
+| `DB_NAME` / `WORDPRESS_DB_NAME` | Database name |
+| `DB_USER` / `WORDPRESS_DB_USER` | User |
+| `DB_PASS` / `WORDPRESS_DB_PASSWORD` | Password |
+| `DB_PORT` | Port (default 3306) |
+| `DB_EXPORT_PASSWORD_HASH` | Login hash (otherwise first-run setup writes `db-dump-auth.php`) |
+| `DB_EXPORT_TOKEN` | Optional `X-Auth-Token` for automation |
+
+---
+
+## Self-test
+
+From the project directory:
+
+```bash
+php db-dump.php --self-test
+```

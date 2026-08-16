@@ -1,1 +1,4 @@
 .DS_Store
+db_exports/
+db-dump-auth.php
+db-dump-auth.php.tmp
