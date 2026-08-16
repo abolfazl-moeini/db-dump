@@ -39,7 +39,7 @@ Or use this tool on localhost (Export Dump tab).
 
 1. Upload `db-dump.php` (WordPress root is fine; it will read `wp-config.php`).
 2. Open `https://your-domain.com/db-dump.php` and set a password.
-3. Upload `dump.sql.gz` in the tool, or FTP it into `db_exports/`.
+3. Choose `dump.sql.gz` in the tool. The browser uploads it in 2 MB chunks so PHP `upload_max_filesize` / `post_max_size` do not block large dumps. You can still FTP a file into `db_exports/` if you prefer.
 
 ### 3. Run the import
 
