@@ -752,7 +752,7 @@ $config = [
     'dest_db_pass'     => getenv('DEST_DB_PASS') ?: '',
     'dest_db_port'     => (int) (getenv('DEST_DB_PORT') ?: 3306),
     'chunk_size'       => 10000,
-    'time_limit'       => 25,
+    'time_limit'       => 35,
     'max_insert_bytes' => 2097152,
     'max_insert_rows'  => 1000,
     'export_dir'       => __DIR__ . '/db_exports/',
@@ -1475,6 +1475,7 @@ class DatabaseImporter
         $this->db->query("SET SESSION UNIQUE_CHECKS = 0");
         $this->db->query("SET SESSION SQL_MODE = 'NO_AUTO_VALUE_ON_ZERO'");
         $this->db->query("SET SESSION max_allowed_packet = 1073741824");
+        $this->db->query("SET SESSION autocommit = 0");
     }
 
     public function init(array $options): array
@@ -1569,6 +1570,8 @@ class DatabaseImporter
             }
 
             $this->connect();
+            $this->db->query("START TRANSACTION");
+
             $filePath = $this->config['export_dir'] . $state['file_name'];
             $fp = fopen($filePath, 'rb');
             if ($fp === false) {
@@ -1583,16 +1586,20 @@ class DatabaseImporter
             $queriesThisChunk = 0;
 
             while (!feof($fp)) {
-                $line = fgets($fp, 65536);
-                if ($line === false) {
+                $block = fread($fp, 524288);
+                if ($block === false || $block === '') {
                     break;
                 }
                 $state['offset'] = ftell($fp);
-                $statements = $splitter->ingest($line);
+                $statements = $splitter->ingest($block);
                 foreach ($statements as $sql) {
                     $this->execImportSql($sql, $state);
                     $state['queries_count']++;
                     $queriesThisChunk++;
+                    if ($queriesThisChunk % 1000 === 0) {
+                        $this->db->query("COMMIT");
+                        $this->db->query("START TRANSACTION");
+                    }
                 }
                 if ((microtime(true) - $startTime) > ($timeLimit - 2)) {
                     break;
@@ -1601,10 +1608,12 @@ class DatabaseImporter
 
             $eof = feof($fp);
             fclose($fp);
+            $this->db->query("COMMIT");
             $state['parser'] = $splitter->toState();
             $state['last_chunk_at'] = time();
 
             if ($eof) {
+                $this->db->query("START TRANSACTION");
                 foreach ($splitter->finish() as $sql) {
                     $this->execImportSql($sql, $state);
                     $state['queries_count']++;
@@ -1616,8 +1625,10 @@ class DatabaseImporter
                     $splitter->buffer = '';
                     $state['parser'] = $splitter->toState();
                 }
+                $this->db->query("COMMIT");
                 $this->db->query("SET SESSION FOREIGN_KEY_CHECKS = 1");
                 $this->db->query("SET SESSION UNIQUE_CHECKS = 1");
+                $this->db->query("SET SESSION autocommit = 1");
 
                 if (!empty($state['wp_search_replace']) && ($state['search_old'] ?? '') !== '' && ($state['search_new'] ?? '') !== '') {
                     $state['phase'] = 'replacing';
@@ -3396,13 +3407,24 @@ $self = htmlspecialchars(scriptName(), ENT_QUOTES, 'UTF-8');
                             search_new: document.getElementById('searchNew').value.trim(),
                             wp_search_replace: document.getElementById('wpSearchReplace').checked
                         });
-                        showStatus(init.message, 'info');
+                        const importStartTime = Date.now();
                         while (true) {
                             const chunk = await apiCall('process_import', {});
                             updateProgress(chunk.percent || 0);
-                            showStatus(chunk.message, chunk.done ? 'success' : 'info');
+
+                            let extra = '';
+                            if (!chunk.done && chunk.offset > 0 && chunk.total_size > 0) {
+                                const elapsed = (Date.now() - importStartTime) / 1000;
+                                const speed = elapsed > 0 ? (chunk.offset / elapsed) : 0;
+                                const remaining = speed > 0 ? Math.ceil((chunk.total_size - chunk.offset) / speed) : 0;
+                                const speedText = speed > 0 ? (' • ' + formatBytes(speed) + '/s') : '';
+                                const etaText = remaining > 0 ? (' • ' + (remaining >= 60 ? Math.ceil(remaining / 60) + 'm' : remaining + 's') + ' remaining') : '';
+                                extra = speedText + etaText;
+                            }
+
+                            showStatus((chunk.message || '') + extra, chunk.done ? 'success' : 'info');
                             if (chunk.done) break;
-                            await new Promise(r => setTimeout(r, 50));
+                            await new Promise(r => setTimeout(r, 40));
                         }
                     } catch (err) {
                         showStatus('Import error: ' + err.message, 'error');
