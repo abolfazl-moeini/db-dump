@@ -105,7 +105,7 @@ function stripDefiner(string $sql): string
 
 function fixSqlCollationCompatibility(string $sql): string
 {
-    // Convert MySQL 8.0+ collations to standard utf8mb4 collations supported by MariaDB and older MySQL
+    $sql = preg_replace('/utf8mb4_0900_bin/i', 'utf8mb4_bin', $sql) ?? $sql;
     return preg_replace('/utf8mb4_0900_[a-z0-9_]+/i', 'utf8mb4_unicode_520_ci', $sql) ?? $sql;
 }
 
@@ -115,13 +115,10 @@ function shouldSkipImportSql(string $sql): bool
     if ($trimmed === '') {
         return true;
     }
-    // Skip binary log & GTID replication statements that require SUPER / BINLOG ADMIN privileges
-    if (preg_match('/^SET\s+(?:@@SESSION\.|@@GLOBAL\.|@)?[A-Za-z0-9_]*SQL_LOG_BIN/i', $trimmed)
-        || preg_match('/^SET\s+@MYSQLDUMP_TEMP_LOG_BIN/i', $trimmed)
-        || preg_match('/^SET\s+@@GLOBAL\.GTID_PURGED/i', $trimmed)) {
-        return true;
+    if (!preg_match('/^\s*(?:\/\*![\d]*\s*)?SET\b/i', $trimmed)) {
+        return false;
     }
-    return false;
+    return (bool) preg_match('/\bSQL_LOG_BIN\b|\bGTID_PURGED\b|\bMYSQLDUMP_TEMP_LOG_BIN\b/i', $trimmed);
 }
 
 function looksLikeSqlErrorIgnorable(string $err, string $sql = ''): bool
@@ -132,8 +129,7 @@ function looksLikeSqlErrorIgnorable(string $err, string $sql = ''): bool
             $sql
         );
     }
-    // Ignore SUPER/BINLOG ADMIN privilege errors on SET statements
-    if (preg_match('/SUPER|BINLOG ADMIN/i', $err) && preg_match('/^\s*SET\s+/i', $sql)) {
+    if (preg_match('/SUPER|BINLOG ADMIN/i', $err) && preg_match('/^\s*(?:\/\*![\d]*\s*)?SET\b/i', $sql)) {
         return true;
     }
     return false;
@@ -204,11 +200,33 @@ class SqlStatementSplitter
                 $skip = strcspn($chunk, "\n", $i);
                 if ($skip > 0) {
                     $i += $skip;
-                    if ($i >= $len) break;
+                    if ($i >= $len) {
+                        break;
+                    }
                 }
                 $this->inLineComment = false;
                 $this->buffer .= "\n";
                 continue;
+            }
+
+            // Fast skip inside comments up to the next *
+            if ($this->inExecutableComment) {
+                $skip = strcspn($chunk, '*', $i);
+                if ($skip > 0) {
+                    $this->buffer .= substr($chunk, $i, $skip);
+                    $i += $skip;
+                    if ($i >= $len) {
+                        break;
+                    }
+                }
+            } elseif ($this->inBlockComment) {
+                $skip = strcspn($chunk, '*', $i);
+                if ($skip > 0) {
+                    $i += $skip;
+                    if ($i >= $len) {
+                        break;
+                    }
+                }
             }
 
             // Fast skip in strings
@@ -710,9 +728,15 @@ function runSelfTests(): int
     $assert(shouldSkipImportSql('SET @@GLOBAL.GTID_PURGED=/*!80000 \'+\'*/ \'\''), 'skip SET GTID_PURGED');
     $assert(shouldSkipImportSql('SET @MYSQLDUMP_TEMP_LOG_BIN = @@SESSION.SQL_LOG_BIN'), 'skip SET MYSQLDUMP_TEMP_LOG_BIN');
     $assert(!shouldSkipImportSql('SET FOREIGN_KEY_CHECKS=0'), 'do not skip SET FOREIGN_KEY_CHECKS');
+    $assert(shouldSkipImportSql('SET @@sql_log_bin=0'), 'skip SET @@sql_log_bin');
+    $assert(shouldSkipImportSql('/*!40101 SET @OLD_SQL_LOG_BIN=@@SQL_LOG_BIN, SQL_LOG_BIN=0 */'), 'skip executable-comment SQL_LOG_BIN');
     $assert(looksLikeSqlErrorIgnorable('Access denied; you need SUPER, BINLOG ADMIN privilege(s)', 'SET @@SESSION.SQL_LOG_BIN= 0'), 'ignore SUPER error on SET');
     $assert(stripDefiner('CREATE DEFINER=`root`@`localhost` VIEW `v` AS SELECT 1') === 'CREATE VIEW `v` AS SELECT 1', 'stripDefiner on view');
     $assert(fixSqlCollationCompatibility('CREATE TABLE t (id INT) COLLATE=utf8mb4_0900_ai_ci') === 'CREATE TABLE t (id INT) COLLATE=utf8mb4_unicode_520_ci', 'convert MySQL 8 collation');
+    $assert(fixSqlCollationCompatibility('COLLATE utf8mb4_0900_bin') === 'COLLATE utf8mb4_bin', 'convert MySQL 8 binary collation');
+
+    $split = new SqlStatementSplitter();
+    $assert($split->ingest("-- comment\nSELECT 1;") === ['SELECT 1'], 'line comment then statement after fast skip');
 
     echo "\n{$ok} passed, {$fail} failed\n";
     return $fail === 0 ? 0 : 1;
@@ -795,7 +819,7 @@ $config = [
     'dest_db_pass'     => getenv('DEST_DB_PASS') ?: '',
     'dest_db_port'     => (int) (getenv('DEST_DB_PORT') ?: 3306),
     'chunk_size'       => 10000,
-    'time_limit'       => 35,
+    'time_limit'       => 28,
     'max_insert_bytes' => 2097152,
     'max_insert_rows'  => 1000,
     'export_dir'       => __DIR__ . '/db_exports/',
@@ -1600,7 +1624,14 @@ class DatabaseImporter
 
             if (($state['phase'] ?? '') === 'replacing') {
                 $this->connect();
-                $state = $this->replaceChunk($state, $startTime, $timeLimit);
+                $this->db->query('START TRANSACTION');
+                try {
+                    $state = $this->replaceChunk($state, $startTime, $timeLimit);
+                    $this->db->query('COMMIT');
+                } catch (Throwable $e) {
+                    $this->db->query('ROLLBACK');
+                    throw $e;
+                }
                 $this->saveState($state);
                 $done = ($state['status'] ?? '') === 'done';
                 return $this->progress(
@@ -1613,7 +1644,7 @@ class DatabaseImporter
             }
 
             $this->connect();
-            $this->db->query("START TRANSACTION");
+            $this->db->query('START TRANSACTION');
 
             $filePath = $this->config['export_dir'] . $state['file_name'];
             $fp = fopen($filePath, 'rb');
@@ -1626,52 +1657,64 @@ class DatabaseImporter
 
             $splitter = new SqlStatementSplitter();
             $splitter->fromState($state['parser'] ?? []);
-            $queriesThisChunk = 0;
 
-            while (!feof($fp)) {
-                $block = fread($fp, 524288);
-                if ($block === false || $block === '') {
-                    break;
-                }
-                $state['offset'] = ftell($fp);
-                $statements = $splitter->ingest($block);
-                foreach ($statements as $sql) {
-                    $this->execImportSql($sql, $state);
-                    $state['queries_count']++;
-                    $queriesThisChunk++;
-                    if ($queriesThisChunk % 1000 === 0) {
-                        $this->db->query("COMMIT");
-                        $this->db->query("START TRANSACTION");
+            try {
+                while (!feof($fp)) {
+                    $block = fread($fp, 524288);
+                    if ($block === false || $block === '') {
+                        break;
+                    }
+                    $state['offset'] = ftell($fp);
+                    $statements = $splitter->ingest($block);
+                    foreach ($statements as $sql) {
+                        if ($this->execImportSql($sql, $state)) {
+                            $state['queries_count']++;
+                        }
+                    }
+                    if ((microtime(true) - $startTime) > ($timeLimit - 2)) {
+                        break;
                     }
                 }
-                if ((microtime(true) - $startTime) > ($timeLimit - 2)) {
-                    break;
+
+                $eof = feof($fp);
+                fclose($fp);
+                $fp = null;
+                $this->db->query('COMMIT');
+            } catch (Throwable $e) {
+                if (is_resource($fp) || is_object($fp)) {
+                    fclose($fp);
                 }
+                $this->db->query('ROLLBACK');
+                throw $e;
             }
 
-            $eof = feof($fp);
-            fclose($fp);
-            $this->db->query("COMMIT");
             $state['parser'] = $splitter->toState();
             $state['last_chunk_at'] = time();
 
             if ($eof) {
-                $this->db->query("START TRANSACTION");
-                foreach ($splitter->finish() as $sql) {
-                    $this->execImportSql($sql, $state);
-                    $state['queries_count']++;
+                $this->db->query('START TRANSACTION');
+                try {
+                    foreach ($splitter->finish() as $sql) {
+                        if ($this->execImportSql($sql, $state)) {
+                            $state['queries_count']++;
+                        }
+                    }
+                    $tail = trim($splitter->buffer);
+                    if ($tail !== '' && !preg_match('/^DELIMITER\s+\S+\s*$/i', $tail)) {
+                        if ($this->execImportSql($tail, $state)) {
+                            $state['queries_count']++;
+                        }
+                        $splitter->buffer = '';
+                        $state['parser'] = $splitter->toState();
+                    }
+                    $this->db->query('COMMIT');
+                } catch (Throwable $e) {
+                    $this->db->query('ROLLBACK');
+                    throw $e;
                 }
-                $tail = trim($splitter->buffer);
-                if ($tail !== '' && !preg_match('/^DELIMITER\s+\S+\s*$/i', $tail)) {
-                    $this->execImportSql($tail, $state);
-                    $state['queries_count']++;
-                    $splitter->buffer = '';
-                    $state['parser'] = $splitter->toState();
-                }
-                $this->db->query("COMMIT");
-                $this->db->query("SET SESSION FOREIGN_KEY_CHECKS = 1");
-                $this->db->query("SET SESSION UNIQUE_CHECKS = 1");
-                $this->db->query("SET SESSION autocommit = 1");
+                $this->db->query('SET SESSION FOREIGN_KEY_CHECKS = 1');
+                $this->db->query('SET SESSION UNIQUE_CHECKS = 1');
+                $this->db->query('SET SESSION autocommit = 1');
 
                 if (!empty($state['wp_search_replace']) && ($state['search_old'] ?? '') !== '' && ($state['search_new'] ?? '') !== '') {
                     $state['phase'] = 'replacing';
@@ -1721,21 +1764,26 @@ class DatabaseImporter
         $dest = $this->config['export_dir'] . $destName;
         $metaPath = $dest . '.meta';
 
-        // Check if import_work.sql is already decompressed and matches the source file
+        // Reuse a previous extract only when dest size still matches the
+        // size recorded after a finished write. Delete the meta first when
+        // extracting so a killed write cannot look like a cache hit.
         if (is_file($dest) && is_file($metaPath)) {
             $meta = json_decode((string) file_get_contents($metaPath), true);
+            $destSize = (int) filesize($dest);
             if (is_array($meta)
                 && ($meta['src'] ?? '') === $name
-                && ($meta['mtime'] ?? 0) === $srcMtime
-                && ($meta['size'] ?? 0) === $srcSize
-                && (int) filesize($dest) > 0) {
-                // Reusing cached extracted SQL file without repeating decompression
+                && (int) ($meta['mtime'] ?? 0) === $srcMtime
+                && (int) ($meta['size'] ?? 0) === $srcSize
+                && (int) ($meta['bytes'] ?? 0) === $destSize
+                && $destSize > 0) {
                 $state['file_name'] = $destName;
-                $state['file_size'] = (int) filesize($dest);
+                $state['file_size'] = $destSize;
                 $state['phase'] = 'importing';
                 return $state;
             }
         }
+
+        @unlink($metaPath);
 
         if (preg_match('/\.zip$/i', $name)) {
             if (!class_exists('ZipArchive')) {
@@ -1787,13 +1835,7 @@ class DatabaseImporter
             fclose($stream);
             $zip->close();
 
-            file_put_contents($metaPath, json_encode([
-                'src'   => $name,
-                'mtime' => $srcMtime,
-                'size'  => $srcSize,
-            ]), LOCK_EX);
-            @chmod($metaPath, 0640);
-
+            $this->writeExtractMeta($metaPath, $name, $srcMtime, $srcSize, $dest);
             $state['file_name'] = $destName;
             $state['file_size'] = (int) filesize($dest) ?: 0;
             $state['phase'] = 'importing';
@@ -1863,13 +1905,7 @@ class DatabaseImporter
             fclose($out);
             gzclose($in);
 
-            file_put_contents($metaPath, json_encode([
-                'src'   => $name,
-                'mtime' => $srcMtime,
-                'size'  => $srcSize,
-            ]), LOCK_EX);
-            @chmod($metaPath, 0640);
-
+            $this->writeExtractMeta($metaPath, $name, $srcMtime, $srcSize, $dest);
             $state['file_name'] = $destName;
             $state['file_size'] = (int) filesize($dest) ?: 0;
             $state['phase'] = 'importing';
@@ -1880,17 +1916,26 @@ class DatabaseImporter
         return $state;
     }
 
-    private function execImportSql(string $sql, array &$state): void
+    private function writeExtractMeta(string $metaPath, string $name, int $srcMtime, int $srcSize, string $dest): void
+    {
+        clearstatcache(true, $dest);
+        file_put_contents($metaPath, json_encode([
+            'src'   => $name,
+            'mtime' => $srcMtime,
+            'size'  => $srcSize,
+            'bytes' => (int) filesize($dest),
+        ]), LOCK_EX);
+        @chmod($metaPath, 0640);
+    }
+
+    private function execImportSql(string $sql, array &$state): bool
     {
         $sql = trim($sql);
         if ($sql === '' || shouldSkipImportSql($sql)) {
-            return;
+            return false;
         }
 
-        if (preg_match('/^\s*CREATE\s+/i', $sql)) {
-            $sql = stripDefiner($sql);
-        }
-
+        $sql = stripDefiner($sql);
         $sql = fixSqlCollationCompatibility($sql);
 
         if (($state['search_old'] ?? '') !== '' && ($state['search_new'] ?? '') !== '' && empty($state['wp_search_replace'])) {
@@ -1905,13 +1950,13 @@ class DatabaseImporter
                 $retrySql = preg_replace('/COLLATE\s*=\s*[a-zA-Z0-9_]+/i', 'COLLATE=utf8mb4_unicode_ci', $sql);
                 $retrySql = preg_replace('/COLLATE\s+[a-zA-Z0-9_]+/i', 'COLLATE utf8mb4_unicode_ci', (string) $retrySql);
                 if ($this->db->query((string) $retrySql)) {
-                    return;
+                    return true;
                 }
                 $err = $this->db->error;
             }
 
             if (looksLikeSqlErrorIgnorable($err, $sql)) {
-                return;
+                return false;
             }
             $state['errors'][] = $err;
             if (count($state['errors']) > 20) {
@@ -1921,7 +1966,9 @@ class DatabaseImporter
                 throw new RuntimeException('SQL import failed: ' . $err . ' — ' . substr($sql, 0, 180));
             }
             error_log('SQL Import Notice: ' . $err . ' in ' . substr($sql, 0, 150));
+            return false;
         }
+        return true;
     }
 
     private function listReplaceTargets(): array
@@ -2066,7 +2113,9 @@ class DatabaseImporter
     private function cleanupWorkFile(array $state): void
     {
         if (($state['file_name'] ?? '') === 'import_work.sql') {
-            @unlink($this->config['export_dir'] . 'import_work.sql');
+            $work = $this->config['export_dir'] . 'import_work.sql';
+            @unlink($work);
+            @unlink($work . '.meta');
         }
     }
 
@@ -3387,7 +3436,7 @@ $self = htmlspecialchars(scriptName(), ENT_QUOTES, 'UTF-8');
                     if (!/\.(sql|gz|zip)$/i.test(filename)) {
                         throw new Error('Only .sql, .sql.gz, and .zip files are allowed');
                     }
-                    const chunkSize = 8 * 1024 * 1024; // 8MB chunk for high-speed uploads
+                    const chunkSize = 2 * 1024 * 1024;
                     const totalChunks = Math.max(1, Math.ceil(file.size / chunkSize));
                     const startTime = Date.now();
 
