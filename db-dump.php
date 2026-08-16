@@ -92,14 +92,25 @@ function isAllowedDumpName(string $name): bool
         && !preg_match('/[^A-Za-z0-9._()+\- ]/', $name);
 }
 
+function isUserDumpName(string $name): bool
+{
+    return isAllowedDumpName($name) && $name !== 'import_work.sql';
+}
+
 function stripDefiner(string $sql): string
 {
     return preg_replace('/\s*DEFINER\s*=\s*`[^`]+`@`[^`]+`/i', '', $sql) ?? $sql;
 }
 
-function looksLikeSqlErrorIgnorable(string $err): bool
+function looksLikeSqlErrorIgnorable(string $err, string $sql = ''): bool
 {
-    return (bool) preg_match('/unknown table|unknown view|doesn\'t exist/i', $err);
+    if (!preg_match('/unknown table|unknown view|does(?:n\'t| not) exist/i', $err)) {
+        return false;
+    }
+    return (bool) preg_match(
+        '/^\s*DROP\s+(?:TABLE|VIEW|TRIGGER|PROCEDURE|FUNCTION|EVENT)\s+IF\s+EXISTS\b/i',
+        $sql
+    );
 }
 
 /**
@@ -116,7 +127,9 @@ class SqlStatementSplitter
     public bool $inBlockComment = false;
     public bool $inLineComment = false;
     public bool $inBacktick = false;
+    public bool $inExecutableComment = false;
     public bool $escape = false;
+    private string $pending = '';
 
     public function toState(): array
     {
@@ -128,7 +141,9 @@ class SqlStatementSplitter
             'inBlockComment' => $this->inBlockComment,
             'inLineComment' => $this->inLineComment,
             'inBacktick' => $this->inBacktick,
+            'inExecutableComment' => $this->inExecutableComment,
             'escape' => $this->escape,
+            'pending' => $this->pending,
         ];
     }
 
@@ -141,23 +156,55 @@ class SqlStatementSplitter
         $this->inBlockComment = !empty($s['inBlockComment']);
         $this->inLineComment = !empty($s['inLineComment']);
         $this->inBacktick = !empty($s['inBacktick']);
+        $this->inExecutableComment = !empty($s['inExecutableComment']);
         $this->escape = !empty($s['escape']);
+        $this->pending = (string) ($s['pending'] ?? '');
         if ($this->delimiter === '') {
             $this->delimiter = ';';
         }
     }
 
-    public function ingest(string $chunk): array
+    public function ingest(string $chunk, bool $final = false): array
     {
         $statements = [];
+        if ($this->pending !== '') {
+            $chunk = $this->pending . $chunk;
+            $this->pending = '';
+        }
         $len = strlen($chunk);
         for ($i = 0; $i < $len; $i++) {
             $ch = $chunk[$i];
             $next = ($i + 1 < $len) ? $chunk[$i + 1] : '';
 
+            // Defer ambiguous trailing characters until the next chunk. This
+            // keeps comments, doubled quotes, and delimiters intact when a
+            // statement boundary falls exactly at the read boundary.
+            if (!$final && $i === $len - 1) {
+                if (($this->inString && $ch === $this->stringChar)
+                    || ($this->inBacktick && $ch === '`')
+                    || ($this->inBlockComment && $ch === '*')
+                    || ($this->inExecutableComment && $ch === '*')
+                    || (!$this->inString && !$this->inBacktick && !$this->inBlockComment
+                        && !$this->inExecutableComment && ($ch === '/' || $ch === '-'))) {
+                    $this->pending = $ch;
+                    continue;
+                }
+            }
+
             if ($this->inLineComment) {
                 if ($ch === "\n") {
                     $this->inLineComment = false;
+                    $this->buffer .= "\n";
+                }
+                continue;
+            }
+
+            if ($this->inExecutableComment) {
+                $this->buffer .= $ch;
+                if ($ch === '*' && $next === '/') {
+                    $this->buffer .= $next;
+                    $this->inExecutableComment = false;
+                    $i++;
                 }
                 continue;
             }
@@ -206,6 +253,7 @@ class SqlStatementSplitter
             }
 
             if ($ch === '#' || ($ch === '-' && $next === '-' && $this->isDashComment($chunk, $i))) {
+                $this->appendCommentSeparator();
                 $this->inLineComment = true;
                 if ($ch === '-') {
                     $i++;
@@ -216,9 +264,12 @@ class SqlStatementSplitter
             if ($ch === '/' && $next === '*') {
                 $third = ($i + 2 < $len) ? $chunk[$i + 2] : '';
                 if ($third === '!') {
-                    $this->buffer .= $ch;
+                    $this->buffer .= '/*!';
+                    $this->inExecutableComment = true;
+                    $i += 2;
                     continue;
                 }
+                $this->appendCommentSeparator();
                 $this->inBlockComment = true;
                 $i++;
                 continue;
@@ -260,6 +311,18 @@ class SqlStatementSplitter
         }
 
         return $statements;
+    }
+
+    public function finish(): array
+    {
+        return $this->ingest('', true);
+    }
+
+    private function appendCommentSeparator(): void
+    {
+        if ($this->buffer !== '' && !preg_match('/\s$/', $this->buffer)) {
+            $this->buffer .= ' ';
+        }
     }
 
     private function isDashComment(string $chunk, int $i): bool
@@ -517,20 +580,40 @@ function runSelfTests(): int
     $nestedOut = unserialize($sr->replace($nested), ['allowed_classes' => false]);
     $assert($nestedOut['theme']['url'] === 'https://new.test' && $nestedOut['theme']['more'][0] === 'https://new.test/x', 'nested serialized replace');
 
-    $assert(!looksLikeSqlErrorIgnorable('Table \'wp_posts\' already exists'), 'do not ignore already exists');
-    $assert(looksLikeSqlErrorIgnorable("Unknown table 'wp_foo'"), 'ignore missing drop target');
+    $assert(!looksLikeSqlErrorIgnorable('Table \'wp_posts\' already exists', 'CREATE TABLE wp_posts'), 'do not ignore already exists');
+    $assert(looksLikeSqlErrorIgnorable("Unknown table 'wp_foo'", 'DROP TABLE IF EXISTS wp_foo'), 'ignore missing drop target');
+    $assert(!looksLikeSqlErrorIgnorable("Unknown table 'wp_foo'", 'ALTER TABLE wp_foo ADD x INT'), 'do not ignore missing table in other SQL');
 
     $split = new SqlStatementSplitter();
     $out = $split->ingest("SELECT `col;name` FROM `wp-posts`;\n");
     $assert($out === ['SELECT `col;name` FROM `wp-posts`'], 'semicolon inside backticks');
 
-    $assert(isAllowedDumpName('dump.sql.gz') && !isAllowedDumpName('../x.sql') && !isAllowedDumpName('x.php.sql.'), 'dump name allowlist');
+    $assert(isUserDumpName('dump.sql.gz') && !isUserDumpName('import_work.sql') && !isUserDumpName('../x.sql') && !isUserDumpName('x.php.sql.'), 'dump name allowlist');
     $assert(safeBasename('a/b\\c.sql') === 'c.sql', 'basename traversal stripped');
 
     $host = parseDbHost('127.0.0.1:3307');
     $assert($host['host'] === '127.0.0.1' && $host['port'] === 3307, 'host:port parse');
     $sock = parseDbHost('localhost:/tmp/mysql.sock');
     $assert($sock['host'] === 'localhost' && $sock['socket'] === '/tmp/mysql.sock', 'socket parse');
+
+    $split = new SqlStatementSplitter();
+    $assert($split->ingest('SELECT/* comment */1;') === ['SELECT 1'], 'block comment preserves token boundary');
+
+    $split = new SqlStatementSplitter();
+    $split->ingest('SELECT /');
+    $assert($split->ingest('* comment */ 1;') === ['SELECT  1'], 'block comment across chunks');
+
+    $split = new SqlStatementSplitter();
+    $split->ingest("SELECT 'it'");
+    $assert($split->ingest("'s';") === ["SELECT 'it''s'"], 'doubled quote across chunks');
+
+    $split = new SqlStatementSplitter();
+    $out = $split->ingest("/*!50000 SET @a=1; SET @b=2 */;");
+    $assert($out === ['/*!50000 SET @a=1; SET @b=2 */'], 'executable comment semicolon protected');
+
+    $split = new SqlStatementSplitter();
+    $split->ingest("SELECT 1");
+    $assert($split->finish() === [], 'finish does not invent a delimiter');
 
     echo "\n{$ok} passed, {$fail} failed\n";
     return $fail === 0 ? 0 : 1;
@@ -670,12 +753,19 @@ function jsonExit($data, int $code = 200): void
 function dbConnect(array $config, ?string $host = null, ?string $user = null, ?string $pass = null, ?string $name = null, ?int $port = null): mysqli
 {
     mysqli_report(MYSQLI_REPORT_OFF);
-    $host = $host ?? $config['db_host'];
+    $usingDefaultConnection = $host === null && $user === null && $pass === null && $name === null && $port === null;
+    $rawHost = $host ?? $config['db_host'];
+    $parsedHost = parseDbHost((string) $rawHost);
+    $host = $parsedHost['host'];
     $user = $user ?? $config['db_user'];
     $pass = $pass ?? $config['db_pass'];
     $name = $name ?? $config['db_name'];
-    $port = $port ?? (int) $config['db_port'];
-    $socket = $config['db_socket'] ?? null;
+    $port = $parsedHost['port'] ?? ($port ?? (int) $config['db_port']);
+    $socket = $parsedHost['socket'] ?? ($usingDefaultConnection ? ($config['db_socket'] ?? null) : null);
+
+    if ($port < 1 || $port > 65535) {
+        throw new InvalidArgumentException('Database port must be between 1 and 65535.');
+    }
 
     if ($name === '' || $user === '') {
         throw new RuntimeException('Database credentials are missing. Place this file next to wp-config.php or set DB_HOST/DB_NAME/DB_USER/DB_PASS.');
@@ -895,10 +985,13 @@ if (isset($_GET['action']) && in_array($_GET['action'], $fileActions, true)) {
             jsonExit(['error' => 'Upload error code: ' . (int) $up['error']], 400);
         }
         $name = safeBasename((string) ($up['name'] ?? ''));
-        if (!isAllowedDumpName($name)) {
+        if (!isUserDumpName($name)) {
             jsonExit(['error' => 'Only .sql, .sql.gz, and .zip files with safe names are allowed'], 400);
         }
         $dest = $config['export_dir'] . $name;
+        if (is_file($dest)) {
+            jsonExit(['error' => 'A dump with that name already exists. Delete it first or upload with a new name.'], 409);
+        }
         if (!is_uploaded_file($up['tmp_name']) || !move_uploaded_file($up['tmp_name'], $dest)) {
             jsonExit(['error' => 'Failed to save uploaded file'], 500);
         }
@@ -907,7 +1000,7 @@ if (isset($_GET['action']) && in_array($_GET['action'], $fileActions, true)) {
     }
 
     if ($action === 'download') {
-        if (!$reqFile || !isAllowedDumpName($reqFile) || !is_file($targetPath) || !is_readable($targetPath)) {
+        if (!$reqFile || !isUserDumpName($reqFile) || !is_file($targetPath) || !is_readable($targetPath)) {
             jsonExit(['error' => 'File not found'], 404);
         }
         $fileSize = (int) filesize($targetPath);
@@ -979,7 +1072,7 @@ if (isset($_GET['action']) && in_array($_GET['action'], $fileActions, true)) {
     }
 
     if ($action === 'delete') {
-        if (!$reqFile || !isAllowedDumpName($reqFile) || !is_file($targetPath)) {
+        if (!$reqFile || !isUserDumpName($reqFile) || !is_file($targetPath)) {
             jsonExit(['error' => 'File not found'], 404);
         }
         if (!@unlink($targetPath)) {
@@ -1023,12 +1116,13 @@ if (isset($_GET['action']) && $_GET['action'] === 'get_tables') {
         $db = dbConnect($config);
         $tables = [];
         $result = $db->query("SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'");
-        if ($result) {
-            while ($row = $result->fetch_row()) {
-                $tables[] = $row[0];
-            }
-            $result->free();
+        if (!$result) {
+            throw new RuntimeException('Could not list database tables: ' . $db->error);
         }
+        while ($row = $result->fetch_row()) {
+            $tables[] = $row[0];
+        }
+        $result->free();
         $db->close();
         jsonExit(['tables' => $tables, 'db_name' => $config['db_name']]);
     } catch (Throwable $e) {
@@ -1069,15 +1163,25 @@ if (isset($_GET['action']) && in_array($_GET['action'], ['copy_table_chunk', 'fi
         try {
             $srcDb = dbConnect($config);
             $destDb = dbConnect($config, $destHost, $destUser, $destPass, $destName, $destPort);
-            $destDb->query("SET SESSION FOREIGN_KEY_CHECKS = 0");
-            $destDb->query("SET SESSION UNIQUE_CHECKS = 0");
+            if (!$destDb->query("SET SESSION FOREIGN_KEY_CHECKS = 0") || !$destDb->query("SET SESSION UNIQUE_CHECKS = 0")) {
+                throw new RuntimeException('Could not configure destination database session: ' . $destDb->error);
+            }
 
             $safeTable = escapeId($table);
-            $exists = $srcDb->query('SHOW TABLES LIKE \'' . $srcDb->real_escape_string($table) . '\'');
-            if (!$exists || $exists->num_rows === 0) {
-                jsonExit(['error' => 'Source table not found: ' . $table], 400);
+            $exists = $srcDb->query("SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'");
+            $tableFound = false;
+            if ($exists) {
+                while ($row = $exists->fetch_row()) {
+                    if ((string) ($row[0] ?? '') === $table) {
+                        $tableFound = true;
+                        break;
+                    }
+                }
+                $exists->free();
             }
-            $exists->free();
+            if (!$tableFound) {
+                throw new InvalidArgumentException('Source table not found: ' . $table);
+            }
 
             if ($offset === 0) {
                 $res = $srcDb->query("SHOW CREATE TABLE {$safeTable}");
@@ -1087,7 +1191,9 @@ if (isset($_GET['action']) && in_array($_GET['action'], ['copy_table_chunk', 'fi
                 $row = $res->fetch_assoc();
                 $createSql = $row['Create Table'] ?? '';
                 $res->free();
-                $destDb->query("DROP TABLE IF EXISTS {$safeTable}");
+                if (!$destDb->query("DROP TABLE IF EXISTS {$safeTable}")) {
+                    throw new RuntimeException("Failed to remove destination table {$table}: " . $destDb->error);
+                }
                 if (!$destDb->query($createSql)) {
                     throw new RuntimeException("Failed to create table {$table}: " . $destDb->error);
                 }
@@ -1141,6 +1247,8 @@ if (isset($_GET['action']) && in_array($_GET['action'], ['copy_table_chunk', 'fi
                 'total_copied' => $nextOffset,
                 'done' => $copiedRows < $chunkSize,
             ]);
+        } catch (InvalidArgumentException $e) {
+            jsonExit(['error' => $e->getMessage()], 400);
         } catch (Throwable $e) {
             jsonExit(['error' => $e->getMessage()], 500);
         }
@@ -1150,30 +1258,42 @@ if (isset($_GET['action']) && in_array($_GET['action'], ['copy_table_chunk', 'fi
         try {
             $srcDb = dbConnect($config);
             $destDb = dbConnect($config, $destHost, $destUser, $destPass, $destName, $destPort);
-            $destDb->query("SET SESSION FOREIGN_KEY_CHECKS = 0");
+            if (!$destDb->query("SET SESSION FOREIGN_KEY_CHECKS = 0")) {
+                throw new RuntimeException('Could not configure destination database session: ' . $destDb->error);
+            }
 
             $views = $srcDb->query("SHOW FULL TABLES WHERE Table_type = 'VIEW'");
-            $copiedViews = 0;
-            if ($views) {
-                while ($row = $views->fetch_row()) {
-                    $viewId = escapeId($row[0]);
-                    $cr = $srcDb->query("SHOW CREATE VIEW {$viewId}");
-                    if ($cr) {
-                        $vrow = $cr->fetch_assoc();
-                        $sql = stripDefiner((string) ($vrow['Create View'] ?? ''));
-                        $destDb->query("DROP VIEW IF EXISTS {$viewId}");
-                        if ($sql !== '') {
-                            $destDb->query($sql);
-                            $copiedViews++;
-                        }
-                        $cr->free();
-                    }
-                }
-                $views->free();
+            if (!$views) {
+                throw new RuntimeException('Could not list source views: ' . $srcDb->error);
             }
+            $copiedViews = 0;
+            while ($row = $views->fetch_row()) {
+                $viewId = escapeId($row[0]);
+                $cr = $srcDb->query("SHOW CREATE VIEW {$viewId}");
+                if (!$cr) {
+                    throw new RuntimeException("Could not read source view {$row[0]}: " . $srcDb->error);
+                }
+                $vrow = $cr->fetch_assoc();
+                $cr->free();
+                $sql = stripDefiner((string) ($vrow['Create View'] ?? ''));
+                if (!$destDb->query("DROP VIEW IF EXISTS {$viewId}")) {
+                    throw new RuntimeException("Failed to remove destination view {$row[0]}: " . $destDb->error);
+                }
+                if ($sql !== '') {
+                    if (!$destDb->query($sql)) {
+                        throw new RuntimeException("Failed to create destination view {$row[0]}: " . $destDb->error);
+                    }
+                    $copiedViews++;
+                } else {
+                    throw new RuntimeException("Empty definition returned for source view {$row[0]}.");
+                }
+            }
+            $views->free();
             $srcDb->close();
             $destDb->close();
             jsonExit(['success' => true, 'message' => "Copy finished. {$copiedViews} view(s) copied."]);
+        } catch (InvalidArgumentException $e) {
+            jsonExit(['error' => $e->getMessage()], 400);
         } catch (Throwable $e) {
             jsonExit(['error' => $e->getMessage()], 500);
         }
@@ -1221,7 +1341,7 @@ class DatabaseImporter
         $fileName = safeBasename((string) ($options['file'] ?? ''));
         $filePath = $this->config['export_dir'] . $fileName;
 
-        if (!isAllowedDumpName($fileName) || !is_file($filePath) || !is_readable($filePath)) {
+        if (!isUserDumpName($fileName) || !is_file($filePath) || !is_readable($filePath)) {
             throw new InvalidArgumentException('Dump file not found.');
         }
 
@@ -1334,6 +1454,10 @@ class DatabaseImporter
             $state['last_chunk_at'] = time();
 
             if ($eof) {
+                foreach ($splitter->finish() as $sql) {
+                    $this->execImportSql($sql, $state);
+                    $state['queries_count']++;
+                }
                 $tail = trim($splitter->buffer);
                 if ($tail !== '' && !preg_match('/^DELIMITER\s+\S+\s*$/i', $tail)) {
                     $this->execImportSql($tail, $state);
@@ -1418,7 +1542,14 @@ class DatabaseImporter
                 $zip->close();
                 throw new RuntimeException('Could not write extracted SQL.');
             }
-            stream_copy_to_stream($stream, $out);
+            $copied = stream_copy_to_stream($stream, $out);
+            if ($copied === false) {
+                fclose($out);
+                fclose($stream);
+                $zip->close();
+                @unlink($dest);
+                throw new RuntimeException('Could not extract SQL file from ZIP archive.');
+            }
             fclose($out);
             fclose($stream);
             $zip->close();
@@ -1429,6 +1560,9 @@ class DatabaseImporter
         }
 
         if (preg_match('/\.gz$/i', $name)) {
+            if (!function_exists('gzopen')) {
+                throw new RuntimeException('GZIP support is not available. Upload a .sql or .zip file.');
+            }
             $destName = 'import_work.sql';
             $dest = $this->config['export_dir'] . $destName;
             $in = gzopen($src, 'rb');
@@ -1443,10 +1577,39 @@ class DatabaseImporter
             set_time_limit(0);
             while (!gzeof($in)) {
                 $buf = gzread($in, 1048576);
-                if ($buf === false || $buf === '') {
+                if ($buf === false) {
+                    fclose($out);
+                    gzclose($in);
+                    @unlink($dest);
+                    throw new RuntimeException('Could not read gzip dump.');
+                }
+                if ($buf === '') {
+                    if (!gzeof($in)) {
+                        fclose($out);
+                        gzclose($in);
+                        @unlink($dest);
+                        throw new RuntimeException('GZIP dump ended unexpectedly.');
+                    }
                     break;
                 }
-                fwrite($out, $buf);
+                $remaining = $buf;
+                while ($remaining !== '') {
+                    $written = fwrite($out, $remaining);
+                    if ($written === false || $written === 0) {
+                        fclose($out);
+                        gzclose($in);
+                        @unlink($dest);
+                        throw new RuntimeException('Could not write decompressed SQL.');
+                    }
+                    $remaining = $written < strlen($remaining) ? substr($remaining, $written) : '';
+                }
+            }
+            $gzError = gzerror($in);
+            if (is_array($gzError) && !in_array((int) ($gzError['level'] ?? Z_OK), [Z_OK, Z_STREAM_END], true)) {
+                fclose($out);
+                gzclose($in);
+                @unlink($dest);
+                throw new RuntimeException('Invalid or truncated gzip dump: ' . (string) ($gzError['message'] ?? 'unknown error'));
             }
             fclose($out);
             gzclose($in);
@@ -1467,7 +1630,7 @@ class DatabaseImporter
         }
         if (!$this->db->query($sql)) {
             $err = $this->db->error;
-            if (looksLikeSqlErrorIgnorable($err)) {
+            if (looksLikeSqlErrorIgnorable($err, $sql)) {
                 return;
             }
             $state['errors'][] = $err;
@@ -1486,7 +1649,7 @@ class DatabaseImporter
         $out = [];
         $res = $this->db->query('SHOW TABLES');
         if (!$res) {
-            return $out;
+            throw new RuntimeException('Could not list tables for search & replace: ' . $this->db->error);
         }
         while ($row = $res->fetch_row()) {
             $t = $row[0];
@@ -1541,9 +1704,7 @@ class DatabaseImporter
             $sql = "SELECT {$colList} FROM {$safeT} LIMIT {$batch} OFFSET {$offset}";
             $rowsRes = $this->db->query($sql);
             if (!$rowsRes) {
-                $idx++;
-                $offset = 0;
-                continue;
+                throw new RuntimeException("Could not read {$t['name']} for search & replace: " . $this->db->error);
             }
             $fetched = 0;
             while ($r = $rowsRes->fetch_assoc()) {
@@ -1565,7 +1726,9 @@ class DatabaseImporter
                         $where[] = escapeId($pk) . " = '" . $this->db->real_escape_string((string) $r[$pk]) . "'";
                     }
                     $upSql = "UPDATE {$safeT} SET " . implode(', ', $updates) . ' WHERE ' . implode(' AND ', $where);
-                    $this->db->query($upSql);
+                    if (!$this->db->query($upSql)) {
+                        throw new RuntimeException("Search & replace update failed on {$t['name']}: " . $this->db->error);
+                    }
                 }
             }
             $rowsRes->free();
@@ -1643,8 +1806,11 @@ class DatabaseImporter
     private function saveState(array $state): void
     {
         $tmp = $this->stateFile . '.tmp';
-        file_put_contents($tmp, json_encode($state, JSON_THROW_ON_ERROR), LOCK_EX);
-        rename($tmp, $this->stateFile);
+        if (file_put_contents($tmp, json_encode($state, JSON_THROW_ON_ERROR), LOCK_EX) === false
+            || !rename($tmp, $this->stateFile)) {
+            @unlink($tmp);
+            throw new RuntimeException('Could not save import progress.');
+        }
     }
 
     private function getState(): ?array
@@ -1749,7 +1915,7 @@ class DatabaseExporter
 
         $ext = ($compression === 'gzip') ? '.sql.gz' : '.sql';
         $safeDb = preg_replace('/[^A-Za-z0-9._-]/', '_', (string) $this->config['db_name']);
-        $fileName = 'dump_' . $safeDb . '_' . date('Y-m-d_His') . $ext;
+        $fileName = 'dump_' . $safeDb . '_' . date('Y-m-d_His') . '_' . bin2hex(random_bytes(3)) . $ext;
 
         $state = [
             'status'          => 'running',
@@ -1895,9 +2061,20 @@ class DatabaseExporter
     {
         $path = $this->config['export_dir'] . $state['file_name'];
         if ($state['compression'] === 'gzip') {
-            return gzopen($path, 'ab1');
+            if (!function_exists('gzopen')) {
+                throw new RuntimeException('GZIP support is not available. Choose plain SQL export.');
+            }
+            $fp = gzopen($path, 'ab1');
+            if ($fp === false) {
+                throw new RuntimeException('Could not open dump file for writing.');
+            }
+            return $fp;
         }
-        return fopen($path, 'ab');
+        $fp = fopen($path, 'ab');
+        if ($fp === false) {
+            throw new RuntimeException('Could not open dump file for writing.');
+        }
+        return $fp;
     }
 
     private function closeWrite($fp, array $state): void
@@ -1914,15 +2091,24 @@ class DatabaseExporter
 
     private function fwriteChecked($fp, string $data, array $state): void
     {
-        $written = ($state['compression'] === 'gzip') ? gzwrite($fp, $data) : fwrite($fp, $data);
-        if ($written === false) {
-            throw new RuntimeException('Failed to write to dump file.');
+        $remaining = $data;
+        while ($remaining !== '') {
+            $written = ($state['compression'] === 'gzip') ? gzwrite($fp, $remaining) : fwrite($fp, $remaining);
+            if ($written === false || $written === 0) {
+                throw new RuntimeException('Failed to write to dump file.');
+            }
+            if ($written < strlen($remaining)) {
+                $remaining = substr($remaining, $written);
+            } else {
+                break;
+            }
         }
     }
 
     private function getFileSize(array $state): int
     {
         $path = $this->config['export_dir'] . $state['file_name'];
+        clearstatcache(true, $path);
         return is_file($path) ? (int) filesize($path) : 0;
     }
 
@@ -1938,11 +2124,15 @@ class DatabaseExporter
             $tableId = escapeId($tableName);
             $this->fwriteChecked($fp, "DROP TABLE IF EXISTS {$tableId};\n", $state);
             $result = $this->db->query("SHOW CREATE TABLE {$tableId}");
-            if ($result) {
-                $row = $result->fetch_row();
-                $this->fwriteChecked($fp, $row[1] . ";\n\n", $state);
-                $result->free();
+            if (!$result) {
+                throw new RuntimeException("Failed to get structure for {$tableName}: " . $this->db->error);
             }
+            $row = $result->fetch_row();
+            $result->free();
+            if (!isset($row[1]) || $row[1] === '') {
+                throw new RuntimeException("Empty structure returned for {$tableName}.");
+            }
+            $this->fwriteChecked($fp, $row[1] . ";\n\n", $state);
             if ((microtime(true) - $startTime) > ($this->config['time_limit'] - 2)) {
                 $state['structure_index'] = $i + 1;
                 return $state;
@@ -2245,6 +2435,7 @@ class DatabaseExporter
     {
         return in_array($field->type, [
             MYSQLI_TYPE_BLOB, MYSQLI_TYPE_LONG_BLOB, MYSQLI_TYPE_MEDIUM_BLOB, MYSQLI_TYPE_TINY_BLOB,
+            MYSQLI_TYPE_STRING, MYSQLI_TYPE_VAR_STRING,
         ], true) && ($field->flags & MYSQLI_BINARY_FLAG);
     }
 
@@ -2271,8 +2462,11 @@ class DatabaseExporter
     private function saveState(array $state): void
     {
         $tmp = $this->stateFile . '.tmp';
-        file_put_contents($tmp, json_encode($state, JSON_THROW_ON_ERROR), LOCK_EX);
-        rename($tmp, $this->stateFile);
+        if (file_put_contents($tmp, json_encode($state, JSON_THROW_ON_ERROR), LOCK_EX) === false
+            || !rename($tmp, $this->stateFile)) {
+            @unlink($tmp);
+            throw new RuntimeException('Could not save export progress.');
+        }
     }
 
     private function getState(): ?array
@@ -2393,6 +2587,8 @@ header('Content-Type: text/html; charset=utf-8');
 header('X-Content-Type-Options: nosniff');
 header('X-Frame-Options: DENY');
 header('Referrer-Policy: no-referrer');
+header('Cache-Control: no-store, no-cache, must-revalidate');
+header('Pragma: no-cache');
 header("Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
 $csrf = htmlspecialchars((string) $_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8');
 $self = htmlspecialchars(scriptName(), ENT_QUOTES, 'UTF-8');
