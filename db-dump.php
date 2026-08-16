@@ -2160,6 +2160,299 @@ class DatabaseImporter
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  SEARCH & REPLACE ENGINE
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class DatabaseSearchReplacer
+{
+    private array $config;
+    private string $stateFile;
+    private string $lockFile;
+    private ?mysqli $db = null;
+
+    public function __construct(array $config, string $stateFile, string $lockFile)
+    {
+        $this->config = $config;
+        $this->stateFile = $stateFile;
+        $this->lockFile = $lockFile;
+    }
+
+    private function connect(): void
+    {
+        $this->db = dbConnect($this->config);
+    }
+
+    private function acquireLock()
+    {
+        $fp = fopen($this->lockFile, 'c+');
+        if ($fp === false || !flock($fp, LOCK_EX | LOCK_NB)) {
+            if (is_resource($fp)) {
+                fclose($fp);
+            }
+            throw new RuntimeException('Another search & replace operation is already running.');
+        }
+        return $fp;
+    }
+
+    private function releaseLock($fp): void
+    {
+        if (is_resource($fp)) {
+            flock($fp, LOCK_UN);
+            fclose($fp);
+        }
+    }
+
+    public function init(array $options): array
+    {
+        $lock = $this->acquireLock();
+        try {
+            $searchOld = trim((string) ($options['search_old'] ?? ''));
+            $searchNew = (string) ($options['search_new'] ?? '');
+            $dryRun = !empty($options['dry_run']);
+            $tables = is_array($options['tables'] ?? null) ? $options['tables'] : [];
+
+            if ($searchOld === '') {
+                throw new InvalidArgumentException('Please enter the string / URL to search for.');
+            }
+
+            $this->connect();
+            $targets = $this->listReplaceTargets($tables);
+            if (empty($targets)) {
+                throw new RuntimeException('No tables selected or no text columns with primary keys found.');
+            }
+
+            $state = [
+                'status' => 'running',
+                'search_old' => $searchOld,
+                'search_new' => $searchNew,
+                'dry_run' => $dryRun,
+                'replace_tables' => $targets,
+                'replace_index' => 0,
+                'replace_offset' => 0,
+                'replace_count' => 0,
+                'rows_scanned' => 0,
+                'tables_modified' => [],
+                'started_at' => time(),
+                'last_chunk_at' => time(),
+            ];
+
+            $this->saveState($state);
+            $modeStr = $dryRun ? ' [Dry Run]' : '';
+            return [
+                'done' => false,
+                'percent' => 0,
+                'message' => "Starting search & replace{$modeStr} across " . count($targets) . ' table(s)…',
+                'total_tables' => count($targets),
+            ];
+        } finally {
+            $this->releaseLock($lock);
+        }
+    }
+
+    public function processChunk(): array
+    {
+        $lock = $this->acquireLock();
+        try {
+            $state = $this->getState();
+            if (!$state) {
+                throw new RuntimeException('No search & replace in progress.');
+            }
+            if (($state['status'] ?? '') === 'done') {
+                return [
+                    'done' => true,
+                    'percent' => 100,
+                    'message' => 'Search & replace already completed.',
+                    'replace_count' => $state['replace_count'] ?? 0,
+                ];
+            }
+
+            $this->connect();
+            $startTime = microtime(true);
+            $timeLimit = (float) $this->config['time_limit'];
+
+            $old = (string) $state['search_old'];
+            $new = (string) $state['search_new'];
+            $dryRun = !empty($state['dry_run']);
+            $replacer = new SerializedSearchReplace($old, $new);
+
+            $tables = $state['replace_tables'];
+            $idx = (int) $state['replace_index'];
+            $offset = (int) $state['replace_offset'];
+            $batch = 500;
+            $totalTables = count($tables);
+
+            $this->db->query('START TRANSACTION');
+            try {
+                while ($idx < $totalTables) {
+                    $t = $tables[$idx];
+                    $tableName = $t['name'];
+                    $safeT = escapeId($tableName);
+                    $colList = implode(', ', array_map('escapeId', array_merge($t['pks'], $t['text'])));
+                    $sql = "SELECT {$colList} FROM {$safeT} LIMIT {$batch} OFFSET {$offset}";
+                    $rowsRes = $this->db->query($sql);
+                    if (!$rowsRes) {
+                        throw new RuntimeException("Could not read {$tableName} for search & replace: " . $this->db->error);
+                    }
+                    $fetched = 0;
+                    while ($r = $rowsRes->fetch_assoc()) {
+                        $fetched++;
+                        $state['rows_scanned']++;
+                        $updates = [];
+                        foreach ($t['text'] as $c) {
+                            $val = $r[$c];
+                            if ($val === null || strpos((string) $val, $old) === false) {
+                                continue;
+                            }
+                            $newVal = $replacer->replace($val);
+                            if ($newVal !== $val) {
+                                if (!$dryRun) {
+                                    $updates[] = escapeId($c) . " = '" . $this->db->real_escape_string((string) $newVal) . "'";
+                                }
+                                if (!in_array($tableName, $state['tables_modified'], true)) {
+                                    $state['tables_modified'][] = $tableName;
+                                }
+                            }
+                        }
+                        if ($updates && !$dryRun) {
+                            $where = [];
+                            foreach ($t['pks'] as $pk) {
+                                $where[] = escapeId($pk) . " = '" . $this->db->real_escape_string((string) $r[$pk]) . "'";
+                            }
+                            $upSql = "UPDATE {$safeT} SET " . implode(', ', $updates) . ' WHERE ' . implode(' AND ', $where);
+                            if (!$this->db->query($upSql)) {
+                                throw new RuntimeException("Search & replace update failed on {$tableName}: " . $this->db->error);
+                            }
+                        }
+                    }
+                    $rowsRes->free();
+                    $state['replace_count'] = $replacer->count + (int) ($state['replace_count'] ?? 0);
+                    $replacer->count = 0;
+
+                    if ($fetched < $batch) {
+                        $idx++;
+                        $offset = 0;
+                    } else {
+                        $offset += $fetched;
+                    }
+
+                    if ((microtime(true) - $startTime) > ($timeLimit - 2)) {
+                        break;
+                    }
+                }
+                $this->db->query('COMMIT');
+            } catch (Throwable $e) {
+                $this->db->query('ROLLBACK');
+                throw $e;
+            }
+
+            $state['replace_index'] = $idx;
+            $state['replace_offset'] = $offset;
+            $state['last_chunk_at'] = time();
+
+            if ($idx >= $totalTables) {
+                $state['status'] = 'done';
+                $this->cleanup();
+                $this->saveState($state);
+                $modeWord = $dryRun ? 'Dry run preview finished (no database changes)' : 'Search & replace completed';
+                $modCount = count($state['tables_modified']);
+                return [
+                    'done' => true,
+                    'percent' => 100,
+                    'message' => "✓ {$modeWord}! {$state['replace_count']} occurrence(s) " . ($dryRun ? 'found' : 'safely replaced') . " in {$modCount} table(s) ({$state['rows_scanned']} rows scanned).",
+                    'replace_count' => $state['replace_count'],
+                    'rows_scanned' => $state['rows_scanned'],
+                    'tables_modified' => $state['tables_modified'],
+                ];
+            }
+
+            $this->saveState($state);
+            $pct = ($totalTables > 0) ? min(99, (int) round(($idx / $totalTables) * 100)) : 0;
+            $currentTableName = $tables[$idx]['name'] ?? '';
+            $modeWord = $dryRun ? ' [Dry Run]' : '';
+            return [
+                'done' => false,
+                'percent' => $pct,
+                'message' => "Searching & replacing{$modeWord}… Table {$idx}/{$totalTables} ({$currentTableName}) • {$state['replace_count']} occurrence(s) found so far",
+                'replace_count' => $state['replace_count'],
+                'rows_scanned' => $state['rows_scanned'],
+            ];
+        } finally {
+            $this->releaseLock($lock);
+        }
+    }
+
+    private function listReplaceTargets(array $filterTables = []): array
+    {
+        $out = [];
+        $res = $this->db->query('SHOW TABLES');
+        if (!$res) {
+            throw new RuntimeException('Could not list database tables: ' . $this->db->error);
+        }
+        $allowed = array_flip($filterTables);
+        while ($row = $res->fetch_row()) {
+            $t = $row[0];
+            if (!empty($filterTables) && !isset($allowed[$t])) {
+                continue;
+            }
+            $meta = $this->describeTable($t);
+            if ($meta !== null) {
+                $out[] = $meta;
+            }
+        }
+        $res->free();
+        return $out;
+    }
+
+    private function describeTable(string $table): ?array
+    {
+        $safeT = escapeId($table);
+        $colsRes = $this->db->query("SHOW COLUMNS FROM {$safeT}");
+        if (!$colsRes) {
+            return null;
+        }
+        $pks = [];
+        $textCols = [];
+        while ($col = $colsRes->fetch_assoc()) {
+            if (($col['Key'] ?? '') === 'PRI') {
+                $pks[] = $col['Field'];
+            }
+            if (preg_match('/char|text|blob/i', (string) ($col['Type'] ?? ''))) {
+                $textCols[] = $col['Field'];
+            }
+        }
+        $colsRes->free();
+        if (!$pks || !$textCols) {
+            return null;
+        }
+        return ['name' => $table, 'pks' => $pks, 'text' => $textCols];
+    }
+
+    private function saveState(array $state): void
+    {
+        $tmp = $this->stateFile . '.tmp';
+        if (file_put_contents($tmp, json_encode($state, JSON_THROW_ON_ERROR), LOCK_EX) === false
+            || !rename($tmp, $this->stateFile)) {
+            @unlink($tmp);
+            throw new RuntimeException('Could not save search & replace progress.');
+        }
+    }
+
+    private function getState(): ?array
+    {
+        if (!is_file($this->stateFile)) {
+            return null;
+        }
+        $content = file_get_contents($this->stateFile);
+        return $content ? json_decode($content, true, 512, JSON_THROW_ON_ERROR) : null;
+    }
+
+    private function cleanup(): void
+    {
+        @unlink($this->stateFile);
+        @unlink($this->stateFile . '.tmp');
+    }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  EXPORTER
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class DatabaseExporter
@@ -2873,16 +3166,18 @@ if (isset($_GET['action'])) {
     requireAuth($config);
 
     $action = (string) $_GET['action'];
-    $mutating = ['init', 'process', 'init_import', 'process_import', 'destroy'];
+    $mutating = ['init', 'process', 'init_import', 'process_import', 'init_replace', 'process_replace', 'destroy'];
     if (in_array($action, $mutating, true)) {
         requirePost();
         requireCsrf($config);
     }
 
-    $exportStateFile = $config['export_dir'] . 'export_state.json';
-    $exportLockFile  = $config['export_dir'] . 'export.lock';
-    $importStateFile = $config['export_dir'] . 'import_state.json';
-    $importLockFile  = $config['export_dir'] . 'import.lock';
+    $exportStateFile  = $config['export_dir'] . 'export_state.json';
+    $exportLockFile   = $config['export_dir'] . 'export.lock';
+    $importStateFile  = $config['export_dir'] . 'import_state.json';
+    $importLockFile   = $config['export_dir'] . 'import.lock';
+    $replaceStateFile = $config['export_dir'] . 'replace_state.json';
+    $replaceLockFile  = $config['export_dir'] . 'replace.lock';
 
     try {
         if ($action === 'init') {
@@ -2902,6 +3197,15 @@ if (isset($_GET['action'])) {
         if ($action === 'process_import') {
             $importer = new DatabaseImporter($config, $importStateFile, $importLockFile);
             jsonExit($importer->processChunk());
+        }
+        if ($action === 'init_replace') {
+            $input = json_decode((string) file_get_contents('php://input'), true) ?: [];
+            $replacer = new DatabaseSearchReplacer($config, $replaceStateFile, $replaceLockFile);
+            jsonExit($replacer->init($input));
+        }
+        if ($action === 'process_replace') {
+            $replacer = new DatabaseSearchReplacer($config, $replaceStateFile, $replaceLockFile);
+            jsonExit($replacer->processChunk());
         }
         if ($action === 'destroy') {
             $input = json_decode((string) file_get_contents('php://input'), true) ?: [];
@@ -3199,6 +3503,7 @@ $self = htmlspecialchars(scriptName(), ENT_QUOTES, 'UTF-8');
 
             <div class="tabs">
                 <button type="button" class="tab-btn active" data-tab="importTab">Import / Restore</button>
+                <button type="button" class="tab-btn" data-tab="replaceTab">Search &amp; Replace</button>
                 <button type="button" class="tab-btn" data-tab="exportTab">Export Dump</button>
                 <button type="button" class="tab-btn" data-tab="copyTab">Direct DB Copy</button>
                 <button type="button" class="tab-btn" data-tab="filesTab">Backup Files</button>
@@ -3236,6 +3541,42 @@ $self = htmlspecialchars(scriptName(), ENT_QUOTES, 'UTF-8');
                     </label>
                 </div>
                 <button type="button" id="startImportBtn" class="btn-success">Start Database Import</button>
+            </div>
+
+            <div id="replaceTab" class="tab-content">
+                <div style="background: #f0fdf4; border: 1px solid #bbf7d0; color: #166534; padding: 12px 14px; border-radius: 8px; font-size: 13px; margin-bottom: 16px; line-height: 1.45;">
+                    <strong>WordPress Serialized-Safe Search &amp; Replace:</strong> Automatically handles PHP serialized strings (widgets, theme mods, plugins, options) with recalculated string lengths, preventing corrupt settings.
+                </div>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px;">
+                    <div class="input-group" style="margin-bottom: 0;">
+                        <label for="standaloneSearchOld">Search for (Old string / URL)</label>
+                        <input type="text" id="standaloneSearchOld" placeholder="http://localhost:8080 or old-domain.com">
+                    </div>
+                    <div class="input-group" style="margin-bottom: 0;">
+                        <label for="standaloneSearchNew">Replace with (New string / URL)</label>
+                        <input type="text" id="standaloneSearchNew" placeholder="https://tavangary.com or new-domain.com">
+                    </div>
+                </div>
+                <div style="margin-bottom: 16px;">
+                    <label style="display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; cursor: pointer;">
+                        <input type="checkbox" id="standaloneDryRun" style="width: auto;">
+                        <span>Dry run preview (scan and count matches without modifying the database)</span>
+                    </label>
+                </div>
+                <div class="table-selector">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                        <label style="margin: 0;">Select tables to scan</label>
+                        <div style="display: flex; gap: 6px;">
+                            <button type="button" class="btn-sm btn-secondary" id="replaceSelectAllBtn">All</button>
+                            <button type="button" class="btn-sm btn-secondary" id="replaceSelectWpCoreBtn">WP Core</button>
+                            <button type="button" class="btn-sm btn-secondary" id="replaceSelectNoneBtn">None</button>
+                        </div>
+                    </div>
+                    <div class="table-list" id="replaceTableList">
+                        <div style="padding: 10px; color: #94a3b8; text-align: center;">Loading tables...</div>
+                    </div>
+                </div>
+                <button type="button" id="startSearchReplaceBtn" class="btn-success">Start Search &amp; Replace</button>
             </div>
 
             <div id="exportTab" class="tab-content">
@@ -3369,19 +3710,34 @@ $self = htmlspecialchars(scriptName(), ENT_QUOTES, 'UTF-8');
                 async function loadTables() {
                     try {
                         const data = await apiCall('get_tables');
-                        const list = document.getElementById('tableList');
+                        const exportList = document.getElementById('tableList');
+                        const replaceList = document.getElementById('replaceTableList');
                         if (!data.tables || data.tables.length === 0) {
-                            list.innerHTML = '<div style="padding:10px;color:#94a3b8;text-align:center;">No tables found</div>';
+                            const emptyHtml = '<div style="padding:10px;color:#94a3b8;text-align:center;">No tables found</div>';
+                            if (exportList) exportList.innerHTML = emptyHtml;
+                            if (replaceList) replaceList.innerHTML = emptyHtml;
                             return;
                         }
-                        list.innerHTML = data.tables.map((t, i) => `
+                        const exportHtml = data.tables.map((t, i) => `
                             <div class="table-item">
                                 <input type="checkbox" id="tbl_${i}" value="${escapeHtml(t)}" checked>
                                 <label for="tbl_${i}">${escapeHtml(t)}</label>
                             </div>
                         `).join('');
+                        const replaceHtml = data.tables.map((t, i) => `
+                            <div class="table-item">
+                                <input type="checkbox" id="rep_tbl_${i}" value="${escapeHtml(t)}" checked>
+                                <label for="rep_tbl_${i}">${escapeHtml(t)}</label>
+                            </div>
+                        `).join('');
+                        if (exportList) exportList.innerHTML = exportHtml;
+                        if (replaceList) replaceList.innerHTML = replaceHtml;
                     } catch (e) {
-                        document.getElementById('tableList').innerHTML = '<div style="padding:10px;color:#991b1b;">' + escapeHtml(e.message) + '</div>';
+                        const errHtml = '<div style="padding:10px;color:#991b1b;">' + escapeHtml(e.message) + '</div>';
+                        const exportList = document.getElementById('tableList');
+                        const replaceList = document.getElementById('replaceTableList');
+                        if (exportList) exportList.innerHTML = errHtml;
+                        if (replaceList) replaceList.innerHTML = errHtml;
                     }
                 }
 
@@ -3673,6 +4029,60 @@ $self = htmlspecialchars(scriptName(), ENT_QUOTES, 'UTF-8');
                     }
                 }
 
+                async function startSearchReplace() {
+                    if (isRunning || isUploading) {
+                        alert(isUploading ? 'File upload is still in progress.' : 'An operation is already running.');
+                        return;
+                    }
+                    const searchOld = document.getElementById('standaloneSearchOld').value.trim();
+                    const searchNew = document.getElementById('standaloneSearchNew').value.trim();
+                    const dryRun = document.getElementById('standaloneDryRun').checked;
+
+                    if (!searchOld) {
+                        alert('Please enter the string / URL to search for.');
+                        return;
+                    }
+
+                    const selected = Array.from(document.querySelectorAll('#replaceTableList input:checked')).map(c => c.value);
+                    if (selected.length === 0) {
+                        alert('Please select at least one table to scan.');
+                        return;
+                    }
+
+                    const prefix = dryRun ? 'DRY RUN PREVIEW: Scan ' : 'CONFIRM: Search & Replace ';
+                    if (!confirm(prefix + '"' + searchOld + '" -> "' + searchNew + '" across ' + selected.length + ' table(s)?')) {
+                        return;
+                    }
+
+                    isRunning = true;
+                    document.getElementById('startSearchReplaceBtn').disabled = true;
+                    showStatus('Initializing search & replace...', 'info');
+                    updateProgress(0);
+
+                    try {
+                        const init = await apiCall('init_replace', {
+                            search_old: searchOld,
+                            search_new: searchNew,
+                            dry_run: dryRun,
+                            tables: selected
+                        });
+                        showStatus(init.message, 'info');
+
+                        while (true) {
+                            const chunk = await apiCall('process_replace', {});
+                            updateProgress(chunk.percent || 0);
+                            showStatus(chunk.message, chunk.done ? 'success' : 'info');
+                            if (chunk.done) break;
+                            await new Promise(r => setTimeout(r, 50));
+                        }
+                    } catch (err) {
+                        showStatus('Search & Replace error: ' + err.message, 'error');
+                    } finally {
+                        isRunning = false;
+                        document.getElementById('startSearchReplaceBtn').disabled = false;
+                    }
+                }
+
                 document.querySelectorAll('.tab-btn').forEach(btn => {
                     btn.addEventListener('click', () => switchTab(btn.dataset.tab));
                 });
@@ -3682,9 +4092,22 @@ $self = htmlspecialchars(scriptName(), ENT_QUOTES, 'UTF-8');
                 document.getElementById('selectNoneBtn').addEventListener('click', () => {
                     document.querySelectorAll('#tableList input[type="checkbox"]').forEach(c => { c.checked = false; });
                 });
+                document.getElementById('replaceSelectAllBtn').addEventListener('click', () => {
+                    document.querySelectorAll('#replaceTableList input[type="checkbox"]').forEach(c => { c.checked = true; });
+                });
+                document.getElementById('replaceSelectNoneBtn').addEventListener('click', () => {
+                    document.querySelectorAll('#replaceTableList input[type="checkbox"]').forEach(c => { c.checked = false; });
+                });
+                document.getElementById('replaceSelectWpCoreBtn').addEventListener('click', () => {
+                    const corePatterns = [/options$/i, /posts$/i, /postmeta$/i, /users$/i, /usermeta$/i, /comments$/i, /commentmeta$/i, /terms$/i, /term_taxonomy$/i, /termmeta$/i, /woocommerce/i];
+                    document.querySelectorAll('#replaceTableList input[type="checkbox"]').forEach(c => {
+                        c.checked = corePatterns.some(p => p.test(c.value));
+                    });
+                });
                 document.getElementById('refreshFilesBtn').addEventListener('click', loadFiles);
                 document.getElementById('uploadFileInput').addEventListener('change', uploadDumpFile);
                 document.getElementById('startImportBtn').addEventListener('click', startImport);
+                document.getElementById('startSearchReplaceBtn').addEventListener('click', startSearchReplace);
                 document.getElementById('startExportBtn').addEventListener('click', startExport);
                 document.getElementById('startCopyBtn').addEventListener('click', startCopy);
                 document.getElementById('destroyBtn').addEventListener('click', destroyTool);
