@@ -103,6 +103,12 @@ function stripDefiner(string $sql): string
     return $cleaned ?? $sql;
 }
 
+function fixSqlCollationCompatibility(string $sql): string
+{
+    // Convert MySQL 8.0+ collations to standard utf8mb4 collations supported by MariaDB and older MySQL
+    return preg_replace('/utf8mb4_0900_[a-z0-9_]+/i', 'utf8mb4_unicode_520_ci', $sql) ?? $sql;
+}
+
 function shouldSkipImportSql(string $sql): bool
 {
     $trimmed = trim($sql);
@@ -670,6 +676,7 @@ function runSelfTests(): int
     $assert(!shouldSkipImportSql('SET FOREIGN_KEY_CHECKS=0'), 'do not skip SET FOREIGN_KEY_CHECKS');
     $assert(looksLikeSqlErrorIgnorable('Access denied; you need SUPER, BINLOG ADMIN privilege(s)', 'SET @@SESSION.SQL_LOG_BIN= 0'), 'ignore SUPER error on SET');
     $assert(stripDefiner('CREATE DEFINER=`root`@`localhost` VIEW `v` AS SELECT 1') === 'CREATE VIEW `v` AS SELECT 1', 'stripDefiner on view');
+    $assert(fixSqlCollationCompatibility('CREATE TABLE t (id INT) COLLATE=utf8mb4_0900_ai_ci') === 'CREATE TABLE t (id INT) COLLATE=utf8mb4_unicode_520_ci', 'convert MySQL 8 collation');
 
     echo "\n{$ok} passed, {$fail} failed\n";
     return $fail === 0 ? 0 : 1;
@@ -1807,11 +1814,25 @@ class DatabaseImporter
             $sql = stripDefiner($sql);
         }
 
+        $sql = fixSqlCollationCompatibility($sql);
+
         if (($state['search_old'] ?? '') !== '' && ($state['search_new'] ?? '') !== '' && empty($state['wp_search_replace'])) {
             $sql = str_replace($state['search_old'], $state['search_new'], $sql);
         }
+
         if (!$this->db->query($sql)) {
             $err = $this->db->error;
+
+            // If unknown collation error, retry with standard utf8mb4_unicode_ci
+            if (preg_match('/unknown collation/i', $err)) {
+                $retrySql = preg_replace('/COLLATE\s*=\s*[a-zA-Z0-9_]+/i', 'COLLATE=utf8mb4_unicode_ci', $sql);
+                $retrySql = preg_replace('/COLLATE\s+[a-zA-Z0-9_]+/i', 'COLLATE utf8mb4_unicode_ci', (string) $retrySql);
+                if ($this->db->query((string) $retrySql)) {
+                    return;
+                }
+                $err = $this->db->error;
+            }
+
             if (looksLikeSqlErrorIgnorable($err, $sql)) {
                 return;
             }
