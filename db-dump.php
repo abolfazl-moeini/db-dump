@@ -199,6 +199,50 @@ class SqlStatementSplitter
         }
         $len = strlen($chunk);
         for ($i = 0; $i < $len; $i++) {
+            // Fast skip in line comments
+            if ($this->inLineComment) {
+                $skip = strcspn($chunk, "\n", $i);
+                if ($skip > 0) {
+                    $i += $skip;
+                    if ($i >= $len) break;
+                }
+                $this->inLineComment = false;
+                $this->buffer .= "\n";
+                continue;
+            }
+
+            // Fast skip in strings
+            if ($this->inString && !$this->escape) {
+                $skip = strcspn($chunk, "\\" . $this->stringChar, $i);
+                if ($skip > 0) {
+                    $this->buffer .= substr($chunk, $i, $skip);
+                    $i += $skip;
+                    if ($i >= $len) break;
+                }
+            }
+
+            // Fast skip in backticks
+            if ($this->inBacktick) {
+                $skip = strcspn($chunk, "`", $i);
+                if ($skip > 0) {
+                    $this->buffer .= substr($chunk, $i, $skip);
+                    $i += $skip;
+                    if ($i >= $len) break;
+                }
+            }
+
+            // Fast skip in normal SQL text
+            if (!$this->inString && !$this->inBacktick && !$this->inBlockComment
+                && !$this->inLineComment && !$this->inExecutableComment) {
+                $specialChars = "'-#/'\"`\r\n" . $this->delimiter;
+                $skip = strcspn($chunk, $specialChars, $i);
+                if ($skip > 0) {
+                    $this->buffer .= substr($chunk, $i, $skip);
+                    $i += $skip;
+                    if ($i >= $len) break;
+                }
+            }
+
             $ch = $chunk[$i];
             $next = ($i + 1 < $len) ? $chunk[$i + 1] : '';
 
@@ -215,14 +259,6 @@ class SqlStatementSplitter
                     $this->pending = $ch;
                     continue;
                 }
-            }
-
-            if ($this->inLineComment) {
-                if ($ch === "\n") {
-                    $this->inLineComment = false;
-                    $this->buffer .= "\n";
-                }
-                continue;
             }
 
             if ($this->inExecutableComment) {
