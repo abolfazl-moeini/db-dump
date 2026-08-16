@@ -1,35 +1,45 @@
-# Database Exporter
+# Database Dump & Restore Tool
 
-A single-file PHP web app for exporting selected MySQL/MariaDB tables to SQL or GZIP, managing backup files, and copying tables to another database. Exports run in chunks, making the tool suitable for shared hosting.
+A lightweight, single-file PHP tool designed for **shared hosting**, **cPanel**, **DirectAdmin**, and **WordPress** to:
+1. **Import / Restore** large `.sql`, `.sql.gz` (GZIP), or `.zip` files in chunks without HTTP or PHP execution timeouts.
+2. **Export** selected database tables to compressed `.sql.gz` or `.sql`.
+3. **Copy** databases directly from one host to another.
+4. **Search & Replace** URLs/domains safely across WordPress serialized data (in `wp_options`, `wp_postmeta`, etc.).
 
-## Quick start
+---
 
-Requirements: PHP 7.4+ with `mysqli`, `zlib` (for GZIP), a MySQL/MariaDB database, and a writable web directory.
+## Features
 
-1. Put `db-dump.php` in a private, HTTPS-enabled web directory.
-2. Remove the `putenv('DB_EXPORT_PASSWORD_HASH=');` line near the top of the file so it does not erase your configured password hash.
-3. Generate a login password hash:
+- **Chunked & Resumable Execution**: Works within 15–25 second HTTP request bursts, preventing server `504 Gateway Timeout` or `max_execution_time` kills on shared hosting.
+- **GZIP Streaming**: Reads and writes `.sql.gz` compressed archives on the fly without heavy memory usage.
+- **WordPress wp-config.php Auto-Detection**: Automatically detects database credentials if placed in your WordPress root or public directory.
+- **Domain Search & Replace**: Automatically updates domain URLs (e.g. `https://tavangarynew.local` -> `https://tavangary.com`) while preserving serialized PHP data length integrity.
+- **File Upload & Browser Manager**: Upload dump files directly from your browser or FTP them to `db_exports/`.
 
+---
+
+## How to Import a Localhost SQL Dump to Server
+
+### Step 1: Export your Localhost Database
+1. You can use this tool on localhost (or WP-CLI `wp db export dump.sql.gz`) to generate a compressed backup file:
    ```bash
-   php -r 'echo password_hash("choose-a-strong-password", PASSWORD_DEFAULT), PHP_EOL;'
+   wp db export dump.sql.gz
    ```
 
-4. Configure your web server/PHP environment:
+### Step 2: Upload to Server
+1. Upload `db-dump.php` to your server (e.g. in `public_html/` or a secure subfolder).
+2. Upload your `dump.sql.gz` (or `dump.sql`) directly to the `db_exports/` directory on the server via FTP / cPanel File Manager (or use the web upload button in the tool).
 
-   ```env
-   DB_EXPORT_PASSWORD_HASH=<generated-hash>
-   DB_EXPORT_TOKEN=<long-random-token>
-   DB_HOST=127.0.0.1
-   DB_PORT=3306
-   DB_NAME=your_database
-   DB_USER=your_user
-   DB_PASS=your_password
-   ```
+### Step 3: Run the Import
+1. Open `https://your-domain.com/db-dump.php` in your browser.
+2. Go to the **Import / Restore** tab.
+3. Select your uploaded dump file from the dropdown.
+4. (Optional) In the **Domain / URL Search & Replace** section:
+   - **Old URL**: `https://tavangarynew.local` (your local dev URL)
+   - **New URL**: `https://your-domain.com` (your live site URL)
+   - Keep "Safely update WordPress serialized strings" checked.
+5. Click **Start Database Import**.
+6. The progress bar will stream through the dump chunk-by-chunk until complete.
 
-   WordPress-style `WORDPRESS_DB_HOST`, `WORDPRESS_DB_NAME`, `WORDPRESS_DB_USER`, and `WORDPRESS_DB_PASSWORD` variables are also supported.
-
-5. Open `db-dump.php` in your browser, sign in, select tables and compression, then click **Start Export**. Backups are stored in `db_exports/`.
-
-Optional destination variables for database copying: `DEST_DB_HOST`, `DEST_DB_PORT`, `DEST_DB_NAME`, `DEST_DB_USER`, and `DEST_DB_PASS`.
-
-> **Security:** Change the default token, never commit credentials or generated `db_exports/` files, use HTTPS, and restrict access by IP or additional web-server authentication when possible.
+### Step 4: Cleanup
+- **IMPORTANT**: Delete `db-dump.php` and the `db_exports/` folder from your server once the import is finished for security!
