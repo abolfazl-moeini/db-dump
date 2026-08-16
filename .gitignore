@@ -6,4 +6,6 @@ db-dump-auth.php.tmp
 *.part
 *.part.meta
 *.part.lock
+*.log
+error_log
 
