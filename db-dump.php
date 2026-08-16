@@ -963,18 +963,64 @@ if (isset($_GET['logout'])) {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  FILE MANAGEMENT
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-$fileActions = ['download', 'delete', 'list_files', 'upload_file'];
+$fileActions = ['download', 'delete', 'list_files', 'upload_file', 'upload_chunk'];
 if (isset($_GET['action']) && in_array($_GET['action'], $fileActions, true)) {
     requireAuth($config);
 
     $action = $_GET['action'];
-    if (in_array($action, ['delete', 'upload_file'], true)) {
+    if (in_array($action, ['delete', 'upload_file', 'upload_chunk'], true)) {
         requirePost();
         requireCsrf($config);
     }
 
     $reqFile = safeBasename((string) ($_GET['file'] ?? ''));
     $targetPath = $config['export_dir'] . $reqFile;
+
+    if ($action === 'upload_chunk') {
+        $name = safeBasename((string) ($_POST['filename'] ?? ''));
+        $chunkIndex = (int) ($_POST['chunk_index'] ?? 0);
+        $totalChunks = (int) ($_POST['total_chunks'] ?? 1);
+
+        if (!isUserDumpName($name)) {
+            jsonExit(['error' => 'Only .sql, .sql.gz, and .zip files with safe names are allowed'], 400);
+        }
+
+        if (empty($_FILES['chunk']) || !is_uploaded_file($_FILES['chunk']['tmp_name'])) {
+            jsonExit(['error' => 'Missing chunk data'], 400);
+        }
+
+        $partPath = $config['export_dir'] . $name . '.part';
+        $finalPath = $config['export_dir'] . $name;
+
+        if ($chunkIndex === 0 && is_file($partPath)) {
+            @unlink($partPath);
+        }
+
+        $in = fopen($_FILES['chunk']['tmp_name'], 'rb');
+        $out = fopen($partPath, $chunkIndex === 0 ? 'wb' : 'ab');
+        if (!$in || !$out) {
+            if ($in) fclose($in);
+            if ($out) fclose($out);
+            jsonExit(['error' => 'Could not write upload chunk'], 500);
+        }
+        stream_copy_to_stream($in, $out);
+        fclose($in);
+        fclose($out);
+
+        if ($chunkIndex >= $totalChunks - 1) {
+            if (is_file($finalPath)) {
+                @unlink($finalPath);
+            }
+            if (!rename($partPath, $finalPath)) {
+                @unlink($partPath);
+                jsonExit(['error' => 'Could not finalize uploaded file'], 500);
+            }
+            @chmod($finalPath, 0640);
+            jsonExit(['success' => true, 'done' => true, 'filename' => $name, 'size' => filesize($finalPath)]);
+        }
+
+        jsonExit(['success' => true, 'done' => false, 'chunk_index' => $chunkIndex]);
+    }
 
     if ($action === 'upload_file') {
         if (empty($_FILES['file']) || !is_array($_FILES['file'])) {
@@ -2875,12 +2921,12 @@ $self = htmlspecialchars(scriptName(), ENT_QUOTES, 'UTF-8');
                         <option value="">-- Choose a file from db_exports/ --</option>
                     </select>
                 </div>
-                <div class="input-group" style="border: 2px dashed #cbd5e1; padding: 16px; border-radius: 8px; text-align: center;">
+                <div class="input-group" style="border: 2px dashed #0284c7; background: #f0f9ff; padding: 16px; border-radius: 8px; text-align: center;">
                     <label style="cursor: pointer; display: block;">
-                        <strong>Or upload (.sql, .sql.gz, .zip)</strong>
+                        <strong style="color: #0369a1;">Or select a local file to upload &amp; import (.sql, .sql.gz, .zip)</strong>
                         <input type="file" id="uploadFileInput" accept=".sql,.gz,.zip" style="margin-top: 8px;">
                     </label>
-                    <div id="uploadStatusText" class="help-text">Larger files can be uploaded via FTP to db_exports/</div>
+                    <div id="uploadStatusText" class="help-text" style="color: #0369a1; margin-top: 6px;">Files are automatically uploaded in small chunks (bypassing hosting size limits)</div>
                 </div>
                 <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px; margin-bottom: 20px;">
                     <label style="font-weight: 700; margin-bottom: 8px;">Domain / URL search &amp; replace (optional)</label>
@@ -3090,36 +3136,109 @@ $self = htmlspecialchars(scriptName(), ENT_QUOTES, 'UTF-8');
                     }
                 }
 
-                async function uploadDumpFile() {
-                    const fileInput = document.getElementById('uploadFileInput');
-                    if (!fileInput.files || fileInput.files.length === 0) return;
-                    const file = fileInput.files[0];
-                    const formData = new FormData();
-                    formData.append('file', file);
-                    showStatus('Uploading ' + file.name + ' (' + formatBytes(file.size) + ')...', 'info');
-                    try {
+                let isUploading = false;
+
+                async function uploadFileInChunks(file, onProgress) {
+                    const chunkSize = 2 * 1024 * 1024; // 2MB chunk
+                    const totalChunks = Math.ceil(file.size / chunkSize);
+                    const filename = file.name;
+
+                    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+                        const start = chunkIndex * chunkSize;
+                        const end = Math.min(start + chunkSize, file.size);
+                        const chunkBlob = file.slice(start, end);
+
+                        const formData = new FormData();
+                        formData.append('filename', filename);
+                        formData.append('chunk_index', chunkIndex.toString());
+                        formData.append('total_chunks', totalChunks.toString());
+                        formData.append('chunk', chunkBlob, filename);
+
                         const url = new URL(API_URL, window.location.href);
-                        url.searchParams.set('action', 'upload_file');
+                        url.searchParams.set('action', 'upload_chunk');
+
                         const res = await fetch(url.toString(), {
                             method: 'POST',
                             headers: { 'X-CSRF-Token': CSRF, 'Accept': 'application/json' },
                             body: formData,
                             credentials: 'same-origin'
                         });
+
                         const data = await res.json();
-                        if (!res.ok || data.error) throw new Error(data.error || ('HTTP ' + res.status));
-                        showStatus('Upload complete: ' + data.filename, 'success');
+                        if (!res.ok || data.error) {
+                            throw new Error(data.error || ('HTTP ' + res.status));
+                        }
+
+                        if (onProgress) {
+                            const percent = Math.round(((chunkIndex + 1) / totalChunks) * 100);
+                            onProgress(percent, end, file.size);
+                        }
+                    }
+                    return filename;
+                }
+
+                async function uploadSelectedFile(file) {
+                    if (isUploading) return;
+                    isUploading = true;
+                    showStatus('Uploading ' + file.name + ' (0%)...', 'info');
+                    updateProgress(0);
+
+                    try {
+                        const uploadedName = await uploadFileInChunks(file, (pct, bytes, total) => {
+                            updateProgress(pct);
+                            showStatus('Uploading ' + file.name + ': ' + pct + '% (' + formatBytes(bytes) + ' / ' + formatBytes(total) + ')...', 'info');
+                        });
+
                         await loadFiles();
-                        document.getElementById('importFileSelect').value = data.filename;
+                        const select = document.getElementById('importFileSelect');
+                        select.value = uploadedName;
+                        updateProgress(100);
+                        showStatus('✓ Upload complete: ' + uploadedName + ' (' + formatBytes(file.size) + '). Ready to import.', 'success');
+                        return uploadedName;
                     } catch (e) {
                         showStatus('Upload failed: ' + e.message, 'error');
+                        throw e;
+                    } finally {
+                        isUploading = false;
+                    }
+                }
+
+                async function uploadDumpFile() {
+                    const fileInput = document.getElementById('uploadFileInput');
+                    if (!fileInput.files || fileInput.files.length === 0) return;
+                    const file = fileInput.files[0];
+                    try {
+                        await uploadSelectedFile(file);
+                    } catch (e) {
+                        console.error(e);
                     }
                 }
 
                 async function startImport() {
                     if (isRunning) return;
-                    const file = document.getElementById('importFileSelect').value;
-                    if (!file) { alert('Please select a dump file to import'); return; }
+                    if (isUploading) {
+                        alert('File upload is still in progress. Please wait a moment.');
+                        return;
+                    }
+
+                    let file = document.getElementById('importFileSelect').value;
+                    const fileInput = document.getElementById('uploadFileInput');
+
+                    // If not chosen in dropdown but a file is picked in file input, upload it first!
+                    if (!file && fileInput.files && fileInput.files.length > 0) {
+                        const pickedFile = fileInput.files[0];
+                        try {
+                            file = await uploadSelectedFile(pickedFile);
+                        } catch (e) {
+                            return;
+                        }
+                    }
+
+                    if (!file) {
+                        alert('Please select a dump file to import (choose from dropdown or select a file to upload)');
+                        return;
+                    }
+
                     if (!confirm('WARNING: Importing ' + file + ' will execute SQL and may overwrite tables. Continue?')) return;
 
                     isRunning = true;
