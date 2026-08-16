@@ -1023,7 +1023,7 @@ if (isset($_GET['action']) && in_array($_GET['action'], $fileActions, true)) {
             jsonExit(['error' => 'Missing chunk data'], 400);
         }
 
-        $maxChunkBytes = 4 * 1024 * 1024;
+        $maxChunkBytes = 16 * 1024 * 1024;
         $maxFileBytes = 2147483647;
         $chunkBytes = (int) filesize($_FILES['chunk']['tmp_name']);
         if ($chunkBytes < 1 || $chunkBytes > $maxChunkBytes) {
@@ -3242,8 +3242,9 @@ $self = htmlspecialchars(scriptName(), ENT_QUOTES, 'UTF-8');
                     if (!/\.(sql|gz|zip)$/i.test(filename)) {
                         throw new Error('Only .sql, .sql.gz, and .zip files are allowed');
                     }
-                    const chunkSize = 2 * 1024 * 1024;
+                    const chunkSize = 8 * 1024 * 1024; // 8MB chunk for high-speed uploads
                     const totalChunks = Math.max(1, Math.ceil(file.size / chunkSize));
+                    const startTime = Date.now();
 
                     for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
                         const start = chunkIndex * chunkSize;
@@ -3272,8 +3273,12 @@ $self = htmlspecialchars(scriptName(), ENT_QUOTES, 'UTF-8');
                         }
 
                         if (onProgress) {
-                            const percent = Math.round(((chunkIndex + 1) / totalChunks) * 100);
-                            onProgress(percent, end, file.size);
+                            const percent = Math.round((end / file.size) * 100);
+                            const elapsedSec = (Date.now() - startTime) / 1000;
+                            const speedBps = elapsedSec > 0 ? (end / elapsedSec) : 0;
+                            const remainingBytes = file.size - end;
+                            const etaSec = speedBps > 0 ? Math.ceil(remainingBytes / speedBps) : 0;
+                            onProgress(percent, end, file.size, speedBps, etaSec);
                         }
                     }
                     return filename;
@@ -3286,9 +3291,11 @@ $self = htmlspecialchars(scriptName(), ENT_QUOTES, 'UTF-8');
                     updateProgress(0);
 
                     try {
-                        const uploadedName = await uploadFileInChunks(file, (pct, bytes, total) => {
+                        const uploadedName = await uploadFileInChunks(file, (pct, bytes, total, speed, eta) => {
                             updateProgress(pct);
-                            showStatus('Uploading ' + file.name + ': ' + pct + '% (' + formatBytes(bytes) + ' / ' + formatBytes(total) + ')...', 'info');
+                            const speedText = speed > 0 ? (' • ' + formatBytes(speed) + '/s') : '';
+                            const etaText = eta > 0 ? (' • ' + eta + 's remaining') : '';
+                            showStatus('Uploading ' + file.name + ': ' + pct + '% (' + formatBytes(bytes) + ' / ' + formatBytes(total) + speedText + etaText + ')', 'info');
                         });
 
                         await loadFiles();
