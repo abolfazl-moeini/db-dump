@@ -4,4 +4,6 @@ db-dump-auth.php
 db-dump-auth.php.tmp
 *.zip
 *.part
+*.part.meta
+*.part.lock
 

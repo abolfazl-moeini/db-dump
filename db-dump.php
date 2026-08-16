@@ -252,17 +252,31 @@ class SqlStatementSplitter
                 continue;
             }
 
-            if ($ch === '#' || ($ch === '-' && $next === '-' && $this->isDashComment($chunk, $i))) {
+            if ($ch === '-' && $next === '-') {
+                if ($i + 2 >= $len && !$final) {
+                    $this->pending = substr($chunk, $i);
+                    break;
+                }
+                if ($this->isDashComment($chunk, $i)) {
+                    $this->appendCommentSeparator();
+                    $this->inLineComment = true;
+                    $i++;
+                    continue;
+                }
+            }
+
+            if ($ch === '#') {
                 $this->appendCommentSeparator();
                 $this->inLineComment = true;
-                if ($ch === '-') {
-                    $i++;
-                }
                 continue;
             }
 
             if ($ch === '/' && $next === '*') {
                 $third = ($i + 2 < $len) ? $chunk[$i + 2] : '';
+                if ($third === '' && !$final) {
+                    $this->pending = substr($chunk, $i);
+                    break;
+                }
                 if ($third === '!') {
                     $this->buffer .= '/*!';
                     $this->inExecutableComment = true;
@@ -365,8 +379,9 @@ class SerializedSearchReplace
                     return $out;
                 }
             } catch (Throwable $e) {
-                // Fall through to plain replace only if it does not look fully serialized.
+                // Incomplete or invalid payload: leave the original value alone.
             }
+            return $value;
         }
         $n = 0;
         $replaced = str_replace($this->from, $this->to, $value, $n);
@@ -614,6 +629,20 @@ function runSelfTests(): int
     $split = new SqlStatementSplitter();
     $split->ingest("SELECT 1");
     $assert($split->finish() === [], 'finish does not invent a delimiter');
+
+    $split = new SqlStatementSplitter();
+    $split->ingest('/*');
+    $assert($split->ingest('!40101 SET NAMES utf8mb4 */;') === ['/*!40101 SET NAMES utf8mb4 */'], 'executable comment split after /*');
+
+    $split = new SqlStatementSplitter();
+    $split->ingest('SELECT 1');
+    $split->ingest('--');
+    $assert($split->ingest("foo;\nSELECT 2;") === ['SELECT 1--foo', 'SELECT 2'], '-- without space is not a comment across chunks');
+
+    $sr = new SerializedSearchReplace('old', 'new');
+    $assert($sr->replace('s:3:"old') === 's:3:"old', 'do not str_replace truncated serialized data');
+    $mixed = serialize('old') . ' old';
+    $assert($sr->replace($mixed) === $mixed, 'do not str_replace if serialized parse is incomplete');
 
     echo "\n{$ok} passed, {$fail} failed\n";
     return $fail === 0 ? 0 : 1;
@@ -978,48 +1007,97 @@ if (isset($_GET['action']) && in_array($_GET['action'], $fileActions, true)) {
 
     if ($action === 'upload_chunk') {
         $name = safeBasename((string) ($_POST['filename'] ?? ''));
-        $chunkIndex = (int) ($_POST['chunk_index'] ?? 0);
-        $totalChunks = (int) ($_POST['total_chunks'] ?? 1);
+        $chunkIndex = (int) ($_POST['chunk_index'] ?? -1);
+        $totalChunks = (int) ($_POST['total_chunks'] ?? 0);
 
         if (!isUserDumpName($name)) {
             jsonExit(['error' => 'Only .sql, .sql.gz, and .zip files with safe names are allowed'], 400);
         }
-
-        if (empty($_FILES['chunk']) || !is_uploaded_file($_FILES['chunk']['tmp_name'])) {
+        if ($chunkIndex < 0 || $totalChunks < 1 || $chunkIndex >= $totalChunks) {
+            jsonExit(['error' => 'Invalid chunk index'], 400);
+        }
+        if (empty($_FILES['chunk'])
+            || (($_FILES['chunk']['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK)
+            || empty($_FILES['chunk']['tmp_name'])
+            || !is_uploaded_file($_FILES['chunk']['tmp_name'])) {
             jsonExit(['error' => 'Missing chunk data'], 400);
         }
 
+        $maxChunkBytes = 4 * 1024 * 1024;
+        $maxFileBytes = 2147483647;
+        $chunkBytes = (int) filesize($_FILES['chunk']['tmp_name']);
+        if ($chunkBytes < 1 || $chunkBytes > $maxChunkBytes) {
+            jsonExit(['error' => 'Invalid chunk size'], 400);
+        }
+
         $partPath = $config['export_dir'] . $name . '.part';
+        $metaPath = $partPath . '.meta';
+        $lockPath = $partPath . '.lock';
         $finalPath = $config['export_dir'] . $name;
 
-        if ($chunkIndex === 0 && is_file($partPath)) {
-            @unlink($partPath);
+        if ($chunkIndex === 0 && is_file($finalPath)) {
+            jsonExit(['error' => 'A dump with that name already exists. Delete it first or upload with a new name.'], 409);
         }
 
-        $in = fopen($_FILES['chunk']['tmp_name'], 'rb');
-        $out = fopen($partPath, $chunkIndex === 0 ? 'wb' : 'ab');
-        if (!$in || !$out) {
-            if ($in) fclose($in);
-            if ($out) fclose($out);
-            jsonExit(['error' => 'Could not write upload chunk'], 500);
-        }
-        stream_copy_to_stream($in, $out);
-        fclose($in);
-        fclose($out);
-
-        if ($chunkIndex >= $totalChunks - 1) {
-            if (is_file($finalPath)) {
-                @unlink($finalPath);
+        $lock = fopen($lockPath, 'c+');
+        if ($lock === false || !flock($lock, LOCK_EX)) {
+            if (is_resource($lock)) {
+                fclose($lock);
             }
-            if (!rename($partPath, $finalPath)) {
+            jsonExit(['error' => 'Could not lock upload'], 500);
+        }
+
+        try {
+            if ($chunkIndex === 0) {
                 @unlink($partPath);
-                jsonExit(['error' => 'Could not finalize uploaded file'], 500);
+                file_put_contents($metaPath, '0', LOCK_EX);
             }
-            @chmod($finalPath, 0640);
-            jsonExit(['success' => true, 'done' => true, 'filename' => $name, 'size' => filesize($finalPath)]);
-        }
 
-        jsonExit(['success' => true, 'done' => false, 'chunk_index' => $chunkIndex]);
+            $expected = is_file($metaPath) ? (int) file_get_contents($metaPath) : -1;
+            if ($chunkIndex !== $expected) {
+                jsonExit(['error' => 'Upload chunks arrived out of order. Start the upload again.'], 409);
+            }
+
+            $in = fopen($_FILES['chunk']['tmp_name'], 'rb');
+            $out = fopen($partPath, $chunkIndex === 0 ? 'wb' : 'ab');
+            if (!$in || !$out) {
+                if ($in) {
+                    fclose($in);
+                }
+                if ($out) {
+                    fclose($out);
+                }
+                jsonExit(['error' => 'Could not write upload chunk'], 500);
+            }
+            stream_copy_to_stream($in, $out);
+            fclose($in);
+            fclose($out);
+
+            clearstatcache(true, $partPath);
+            if ((int) filesize($partPath) > $maxFileBytes) {
+                @unlink($partPath);
+                @unlink($metaPath);
+                jsonExit(['error' => 'Upload exceeds the 2 GB limit'], 400);
+            }
+
+            file_put_contents($metaPath, (string) ($chunkIndex + 1), LOCK_EX);
+
+            if ($chunkIndex === $totalChunks - 1) {
+                if (!@rename($partPath, $finalPath)) {
+                    @unlink($partPath);
+                    @unlink($metaPath);
+                    jsonExit(['error' => 'Could not finalize uploaded file'], 500);
+                }
+                @unlink($metaPath);
+                @chmod($finalPath, 0640);
+                jsonExit(['success' => true, 'done' => true, 'filename' => $name, 'size' => filesize($finalPath)]);
+            }
+
+            jsonExit(['success' => true, 'done' => false, 'chunk_index' => $chunkIndex]);
+        } finally {
+            flock($lock, LOCK_UN);
+            fclose($lock);
+        }
     }
 
     if ($action === 'upload_file') {
@@ -1525,6 +1603,7 @@ class DatabaseImporter
 
                 $state['status'] = 'done';
                 $state['phase'] = 'completed';
+                $this->cleanupWorkFile($state);
                 $this->saveState($state);
                 $errNote = empty($state['errors']) ? '' : ' Notices: ' . count($state['errors']) . ' non-fatal SQL warning(s).';
                 return $this->progress($state, true, "Import completed! {$state['queries_count']} queries executed.{$errNote}");
@@ -1650,12 +1729,22 @@ class DatabaseImporter
                     $remaining = $written < strlen($remaining) ? substr($remaining, $written) : '';
                 }
             }
-            $gzError = gzerror($in);
-            if (is_array($gzError) && !in_array((int) ($gzError['level'] ?? Z_OK), [Z_OK, Z_STREAM_END], true)) {
-                fclose($out);
-                gzclose($in);
-                @unlink($dest);
-                throw new RuntimeException('Invalid or truncated gzip dump: ' . (string) ($gzError['message'] ?? 'unknown error'));
+            if (function_exists('gzerrno')) {
+                $gzErrno = gzerrno($in);
+                $okCodes = [0];
+                if (defined('Z_OK')) {
+                    $okCodes[] = (int) Z_OK;
+                }
+                if (defined('Z_STREAM_END')) {
+                    $okCodes[] = (int) Z_STREAM_END;
+                }
+                if (!in_array($gzErrno, $okCodes, true)) {
+                    $gzMessage = function_exists('gzerror') ? (string) gzerror($in) : ('code ' . $gzErrno);
+                    fclose($out);
+                    gzclose($in);
+                    @unlink($dest);
+                    throw new RuntimeException('Invalid or truncated gzip dump: ' . $gzMessage);
+                }
             }
             fclose($out);
             gzclose($in);
@@ -1745,7 +1834,6 @@ class DatabaseImporter
         while ($idx < count($tables)) {
             $t = $tables[$idx];
             $safeT = escapeId($t['name']);
-            $pkList = implode(', ', array_map('escapeId', $t['pks']));
             $colList = implode(', ', array_map('escapeId', array_merge($t['pks'], $t['text'])));
             $sql = "SELECT {$colList} FROM {$safeT} LIMIT {$batch} OFFSET {$offset}";
             $rowsRes = $this->db->query($sql);
@@ -1798,6 +1886,7 @@ class DatabaseImporter
         if ($idx >= count($tables)) {
             $state['status'] = 'done';
             $state['phase'] = 'completed';
+            $this->cleanupWorkFile($state);
         }
         return $state;
     }
@@ -1827,6 +1916,13 @@ class DatabaseImporter
             'queries_count' => (int) ($state['queries_count'] ?? 0),
             'message' => $message,
         ];
+    }
+
+    private function cleanupWorkFile(array $state): void
+    {
+        if (($state['file_name'] ?? '') === 'import_work.sql') {
+            @unlink($this->config['export_dir'] . 'import_work.sql');
+        }
     }
 
     private function acquireLock()
@@ -3139,9 +3235,15 @@ $self = htmlspecialchars(scriptName(), ENT_QUOTES, 'UTF-8');
                 let isUploading = false;
 
                 async function uploadFileInChunks(file, onProgress) {
-                    const chunkSize = 2 * 1024 * 1024; // 2MB chunk
-                    const totalChunks = Math.ceil(file.size / chunkSize);
-                    const filename = file.name;
+                    if (!file || !file.size) {
+                        throw new Error('File is empty');
+                    }
+                    const filename = (file.name || '').split(/[/\\\\]/).pop();
+                    if (!/\.(sql|gz|zip)$/i.test(filename)) {
+                        throw new Error('Only .sql, .sql.gz, and .zip files are allowed');
+                    }
+                    const chunkSize = 2 * 1024 * 1024;
+                    const totalChunks = Math.max(1, Math.ceil(file.size / chunkSize));
 
                     for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
                         const start = chunkIndex * chunkSize;
@@ -3215,31 +3317,30 @@ $self = htmlspecialchars(scriptName(), ENT_QUOTES, 'UTF-8');
                 }
 
                 async function startImport() {
-                    if (isRunning) return;
-                    if (isUploading) {
-                        alert('File upload is still in progress. Please wait a moment.');
+                    if (isRunning || isUploading) {
+                        alert(isUploading ? 'File upload is still in progress. Please wait a moment.' : 'An operation is already running.');
                         return;
                     }
 
                     let file = document.getElementById('importFileSelect').value;
                     const fileInput = document.getElementById('uploadFileInput');
+                    const pickedFile = (!file && fileInput.files && fileInput.files.length > 0) ? fileInput.files[0] : null;
+                    const label = file || (pickedFile ? pickedFile.name : '');
 
-                    // If not chosen in dropdown but a file is picked in file input, upload it first!
-                    if (!file && fileInput.files && fileInput.files.length > 0) {
-                        const pickedFile = fileInput.files[0];
+                    if (!label) {
+                        alert('Please select a dump file to import (choose from dropdown or select a file to upload)');
+                        return;
+                    }
+
+                    if (!confirm('WARNING: Importing ' + label + ' will execute SQL and may overwrite tables. Continue?')) return;
+
+                    if (pickedFile) {
                         try {
                             file = await uploadSelectedFile(pickedFile);
                         } catch (e) {
                             return;
                         }
                     }
-
-                    if (!file) {
-                        alert('Please select a dump file to import (choose from dropdown or select a file to upload)');
-                        return;
-                    }
-
-                    if (!confirm('WARNING: Importing ' + file + ' will execute SQL and may overwrite tables. Continue?')) return;
 
                     isRunning = true;
                     document.getElementById('startImportBtn').disabled = true;
