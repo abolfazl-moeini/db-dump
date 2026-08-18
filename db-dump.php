@@ -118,7 +118,13 @@ function shouldSkipImportSql(string $sql): bool
     if (!preg_match('/^\s*(?:\/\*![\d]*\s*)?SET\b/i', $trimmed)) {
         return false;
     }
-    return (bool) preg_match('/\bSQL_LOG_BIN\b|\bGTID_PURGED\b|\bMYSQLDUMP_TEMP_LOG_BIN\b/i', $trimmed);
+    if (preg_match('/\bSQL_LOG_BIN\b|\bGTID_PURGED\b|\bMYSQLDUMP_TEMP_LOG_BIN\b/i', $trimmed)) {
+        return true;
+    }
+    if (preg_match('/=\s*@OLD_/i', $trimmed)) {
+        return true;
+    }
+    return false;
 }
 
 function looksLikeSqlErrorIgnorable(string $err, string $sql = ''): bool
@@ -130,6 +136,9 @@ function looksLikeSqlErrorIgnorable(string $err, string $sql = ''): bool
         );
     }
     if (preg_match('/SUPER|BINLOG ADMIN/i', $err) && preg_match('/^\s*(?:\/\*![\d]*\s*)?SET\b/i', $sql)) {
+        return true;
+    }
+    if (preg_match("/can't be set to the value of 'NULL'/i", $err) && preg_match('/^\s*(?:\/\*![\d]*\s*)?SET\b/i', $sql)) {
         return true;
     }
     return false;
@@ -156,7 +165,7 @@ class SqlStatementSplitter
     public function toState(): array
     {
         return [
-            'buffer' => $this->buffer,
+            'buffer_b64' => base64_encode($this->buffer),
             'delimiter' => $this->delimiter,
             'inString' => $this->inString,
             'stringChar' => $this->stringChar,
@@ -165,13 +174,22 @@ class SqlStatementSplitter
             'inBacktick' => $this->inBacktick,
             'inExecutableComment' => $this->inExecutableComment,
             'escape' => $this->escape,
-            'pending' => $this->pending,
+            'pending_b64' => base64_encode($this->pending),
         ];
     }
 
     public function fromState(array $s): void
     {
-        $this->buffer = (string) ($s['buffer'] ?? '');
+        if (array_key_exists('buffer_b64', $s)) {
+            $this->buffer = decodeStateB64($s['buffer_b64']);
+        } else {
+            $this->buffer = (string) ($s['buffer'] ?? '');
+        }
+        if (array_key_exists('pending_b64', $s)) {
+            $this->pending = decodeStateB64($s['pending_b64']);
+        } else {
+            $this->pending = (string) ($s['pending'] ?? '');
+        }
         $this->delimiter = (string) ($s['delimiter'] ?? ';');
         $this->inString = !empty($s['inString']);
         $this->stringChar = (string) ($s['stringChar'] ?? '');
@@ -180,7 +198,6 @@ class SqlStatementSplitter
         $this->inBacktick = !empty($s['inBacktick']);
         $this->inExecutableComment = !empty($s['inExecutableComment']);
         $this->escape = !empty($s['escape']);
-        $this->pending = (string) ($s['pending'] ?? '');
         if ($this->delimiter === '') {
             $this->delimiter = ';';
         }
@@ -738,6 +755,33 @@ function runSelfTests(): int
     $split = new SqlStatementSplitter();
     $assert($split->ingest("-- comment\nSELECT 1;") === ['SELECT 1'], 'line comment then statement after fast skip');
 
+    $assert(shouldSkipImportSql('/*!40103 SET TIME_ZONE=@OLD_TIME_ZONE */'), 'skip SET TIME_ZONE=@OLD_TIME_ZONE');
+    $assert(shouldSkipImportSql('/*!40101 SET SQL_MODE=@OLD_SQL_MODE */'), 'skip SET SQL_MODE=@OLD_SQL_MODE');
+    $assert(shouldSkipImportSql('/*!40014 SET FOREIGN_KEY_CHECKS=@OLD_FOREIGN_KEY_CHECKS */'), 'skip SET FOREIGN_KEY_CHECKS=@OLD_FOREIGN_KEY_CHECKS');
+    $assert(looksLikeSqlErrorIgnorable("Variable 'time_zone' can't be set to the value of 'NULL'", '/*!40103 SET TIME_ZONE=@OLD_TIME_ZONE */'), 'ignore NULL error on SET TIME_ZONE');
+    $assert(looksLikeSqlErrorIgnorable("Variable 'sql_mode' can't be set to the value of 'NULL'", 'SET SQL_MODE=@OLD_SQL_MODE'), 'ignore NULL error on SET SQL_MODE');
+
+    $split = new SqlStatementSplitter();
+    $split->ingest("INSERT INTO t VALUES ('\xFF\xFE\xFD");
+    $state = $split->toState();
+    $json = json_encode($state, JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE);
+    $restored = new SqlStatementSplitter();
+    $restored->fromState(json_decode($json, true));
+    $assert($restored->ingest("');\n") === ["INSERT INTO t VALUES ('\xFF\xFE\xFD')"], 'binary non-utf8 data across chunks with base64 state');
+
+    $dirty = ["name" => "test\xFF\xFE", "nested" => ["val\x80"]];
+    $sanitized = utf8SanitizeRecursive($dirty);
+    $assert(json_encode($sanitized) !== false, 'utf8SanitizeRecursive allows safe json_encode');
+
+    $threw = false;
+    try {
+        $bad = new SqlStatementSplitter();
+        $bad->fromState(['buffer_b64' => '@@@not-base64@@@']);
+    } catch (Throwable $e) {
+        $threw = true;
+    }
+    $assert($threw, 'corrupt base64 parser state throws instead of wiping the buffer');
+
     echo "\n{$ok} passed, {$fail} failed\n";
     return $fail === 0 ? 0 : 1;
 }
@@ -861,6 +905,51 @@ function scriptName(): string
     return $base !== '' ? $base : 'db-dump.php';
 }
 
+function decodeStateB64($encoded): string
+{
+    if (!is_string($encoded) || $encoded === '') {
+        return '';
+    }
+    $decoded = base64_decode($encoded, true);
+    if ($decoded === false) {
+        throw new RuntimeException('Import resume state is corrupt. Start the import again.');
+    }
+    return $decoded;
+}
+
+function utf8SanitizeString(string $data): string
+{
+    if ($data === '' || (function_exists('mb_check_encoding') && mb_check_encoding($data, 'UTF-8'))) {
+        return $data;
+    }
+    if (function_exists('mb_convert_encoding')) {
+        return (string) mb_convert_encoding($data, 'UTF-8', 'UTF-8');
+    }
+    if (function_exists('iconv')) {
+        $converted = @iconv('UTF-8', 'UTF-8//IGNORE', $data);
+        if ($converted !== false) {
+            return $converted;
+        }
+    }
+    return preg_replace('/[\x80-\xFF]/', '?', $data) ?? '';
+}
+
+function utf8SanitizeRecursive($data)
+{
+    if (is_string($data)) {
+        return utf8SanitizeString($data);
+    }
+    if (is_array($data)) {
+        $clean = [];
+        foreach ($data as $k => $v) {
+            $cleanKey = is_string($k) ? utf8SanitizeString($k) : $k;
+            $clean[$cleanKey] = utf8SanitizeRecursive($v);
+        }
+        return $clean;
+    }
+    return $data;
+}
+
 function jsonExit($data, int $code = 200): void
 {
     if (!headers_sent()) {
@@ -869,7 +958,15 @@ function jsonExit($data, int $code = 200): void
         header('X-Content-Type-Options: nosniff');
         header('Cache-Control: no-store');
     }
-    echo json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    $flags = JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE;
+    $json = json_encode($data, $flags);
+    if ($json === false) {
+        $json = json_encode(utf8SanitizeRecursive($data), $flags);
+    }
+    if ($json === false) {
+        $json = '{"error":"Failed to encode response","done":false}';
+    }
+    echo $json;
     exit;
 }
 
@@ -1924,7 +2021,7 @@ class DatabaseImporter
             'mtime' => $srcMtime,
             'size'  => $srcSize,
             'bytes' => (int) filesize($dest),
-        ]), LOCK_EX);
+        ], JSON_INVALID_UTF8_SUBSTITUTE), LOCK_EX);
         @chmod($metaPath, 0640);
     }
 
@@ -2142,7 +2239,7 @@ class DatabaseImporter
     private function saveState(array $state): void
     {
         $tmp = $this->stateFile . '.tmp';
-        if (file_put_contents($tmp, json_encode($state, JSON_THROW_ON_ERROR), LOCK_EX) === false
+        if (file_put_contents($tmp, json_encode($state, JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE), LOCK_EX) === false
             || !rename($tmp, $this->stateFile)) {
             @unlink($tmp);
             throw new RuntimeException('Could not save import progress.');
@@ -2155,7 +2252,15 @@ class DatabaseImporter
             return null;
         }
         $content = file_get_contents($this->stateFile);
-        return $content ? json_decode($content, true, 512, JSON_THROW_ON_ERROR) : null;
+        if (!$content) {
+            return null;
+        }
+        try {
+            $data = json_decode($content, true, 512, JSON_THROW_ON_ERROR);
+            return is_array($data) ? $data : null;
+        } catch (Throwable $e) {
+            return null;
+        }
     }
 }
 
@@ -2429,7 +2534,7 @@ class DatabaseSearchReplacer
     private function saveState(array $state): void
     {
         $tmp = $this->stateFile . '.tmp';
-        if (file_put_contents($tmp, json_encode($state, JSON_THROW_ON_ERROR), LOCK_EX) === false
+        if (file_put_contents($tmp, json_encode($state, JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE), LOCK_EX) === false
             || !rename($tmp, $this->stateFile)) {
             @unlink($tmp);
             throw new RuntimeException('Could not save search & replace progress.');
@@ -2442,7 +2547,15 @@ class DatabaseSearchReplacer
             return null;
         }
         $content = file_get_contents($this->stateFile);
-        return $content ? json_decode($content, true, 512, JSON_THROW_ON_ERROR) : null;
+        if (!$content) {
+            return null;
+        }
+        try {
+            $data = json_decode($content, true, 512, JSON_THROW_ON_ERROR);
+            return is_array($data) ? $data : null;
+        } catch (Throwable $e) {
+            return null;
+        }
     }
 
     private function cleanup(): void
@@ -3091,7 +3204,7 @@ class DatabaseExporter
     private function saveState(array $state): void
     {
         $tmp = $this->stateFile . '.tmp';
-        if (file_put_contents($tmp, json_encode($state, JSON_THROW_ON_ERROR), LOCK_EX) === false
+        if (file_put_contents($tmp, json_encode($state, JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE), LOCK_EX) === false
             || !rename($tmp, $this->stateFile)) {
             @unlink($tmp);
             throw new RuntimeException('Could not save export progress.');
@@ -3104,7 +3217,15 @@ class DatabaseExporter
             return null;
         }
         $content = file_get_contents($this->stateFile);
-        return $content ? json_decode($content, true, 512, JSON_THROW_ON_ERROR) : null;
+        if (!$content) {
+            return null;
+        }
+        try {
+            $data = json_decode($content, true, 512, JSON_THROW_ON_ERROR);
+            return is_array($data) ? $data : null;
+        } catch (Throwable $e) {
+            return null;
+        }
     }
 
     private function cleanup(): void
