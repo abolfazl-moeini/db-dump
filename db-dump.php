@@ -127,6 +127,43 @@ function shouldSkipImportSql(string $sql): bool
     return false;
 }
 
+function describeReplaceTable(mysqli $db, string $table): ?array
+{
+    $safeT = escapeId($table);
+    $colsRes = $db->query("SHOW COLUMNS FROM {$safeT}");
+    if (!$colsRes) {
+        return null;
+    }
+    $pks = [];
+    $uniKeys = [];
+    $compactCols = [];
+    $textCols = [];
+    while ($col = $colsRes->fetch_assoc()) {
+        $field = (string) $col['Field'];
+        $type = (string) ($col['Type'] ?? '');
+        if (($col['Key'] ?? '') === 'PRI') {
+            $pks[] = $field;
+        } elseif (($col['Key'] ?? '') === 'UNI') {
+            $uniKeys[] = $field;
+        }
+        if (preg_match('/char|text|blob|json|enum|set/i', $type)) {
+            $textCols[] = $field;
+        }
+        if (!preg_match('/text|blob|json/i', $type)) {
+            $compactCols[] = $field;
+        }
+    }
+    $colsRes->free();
+    if (!$textCols) {
+        return null;
+    }
+    $keys = $pks ?: ($uniKeys ?: array_slice($compactCols, 0, 1));
+    if (!$keys) {
+        return null;
+    }
+    return ['name' => $table, 'pks' => $keys, 'text' => $textCols];
+}
+
 function looksLikeSqlErrorIgnorable(string $err, string $sql = ''): bool
 {
     if (preg_match('/unknown table|unknown view|does(?:n\'t| not) exist/i', $err)) {
@@ -462,15 +499,47 @@ class SerializedSearchReplace
     {
         $from = trim($from);
         $to = trim($to);
-        if ($from !== '') {
-            $this->addPair($from, $to);
-            // If trailing slash present on both, also add non-trailing slash pair
-            if (substr($from, -1) === '/' && substr($to, -1) === '/' && strlen($from) > 1) {
-                $this->addPair(rtrim($from, '/'), rtrim($to, '/'));
-            } elseif (substr($from, -1) !== '/' && substr($to, -1) !== '/') {
-                $this->addPair($from . '/', $to . '/');
+        if ($from === '') {
+            return;
+        }
+        foreach ($this->expandSearchTerms($from, $to) as $pair) {
+            $this->addPair($pair[0], $pair[1]);
+        }
+        usort($this->pairs, static function ($a, $b) {
+            return strlen($b[0]) <=> strlen($a[0]);
+        });
+    }
+
+    /**
+     * @return array<int, array{0: string, 1: string}>
+     */
+    private function expandSearchTerms(string $from, string $to): array
+    {
+        $froms = [$from];
+        $trimmed = rtrim($from, '/');
+        if ($trimmed !== '' && $trimmed !== $from) {
+            $froms[] = $trimmed;
+        }
+        if (substr($from, -1) !== '/') {
+            $froms[] = $from . '/';
+        }
+
+        $expanded = [];
+        foreach ($froms as $f) {
+            $expanded[] = $f;
+            if (preg_match('#^https://#i', $f)) {
+                $expanded[] = (string) preg_replace('#^https://#i', 'http://', $f);
+            } elseif (preg_match('#^http://#i', $f)) {
+                $expanded[] = (string) preg_replace('#^http://#i', 'https://', $f);
             }
         }
+
+        $toTrim = rtrim($to, '/');
+        $pairs = [];
+        foreach (array_unique($expanded) as $f) {
+            $pairs[] = [$f, substr($f, -1) === '/' ? $toTrim . '/' : $toTrim];
+        }
+        return $pairs;
     }
 
     private function addPair(string $f, string $t): void
@@ -876,6 +945,10 @@ function runSelfTests(): int
     // Test CSS / text starting with a: or s: (must not falsely abort)
     $cssSample = 'a:hover { background: url("https://tavangarynew.local/bg.png"); }';
     $assert($urlReplacer->replace($cssSample) === 'a:hover { background: url("https://tavangary.com/bg.png"); }', 'pseudo-class CSS string not aborted as bad serialized array');
+
+    $schemeReplacer = new SerializedSearchReplace('https://tavangarynew.local/', 'https://tavangary.com/');
+    $assert($schemeReplacer->replace('http://tavangarynew.local/contact') === 'https://tavangary.com/contact', 'https search also replaces http URLs');
+    $assert($schemeReplacer->hasMatch('http://tavangarynew.local') === true, 'https search matches http host without trailing slash');
 
     echo "\n{$ok} passed, {$fail} failed\n";
     return $fail === 0 ? 0 : 1;
@@ -1826,12 +1899,18 @@ class DatabaseImporter
                 }
                 $this->saveState($state);
                 $done = ($state['status'] ?? '') === 'done';
+                $replaceTotal = count($state['replace_tables'] ?? []);
+                $replaceIdx = (int) ($state['replace_index'] ?? 0);
+                $currentTable = $state['replace_tables'][$replaceIdx]['name'] ?? '';
+                $scanNote = $currentTable !== ''
+                    ? " (scanning {$currentTable}, table " . min($replaceIdx + 1, max(1, $replaceTotal)) . "/{$replaceTotal})"
+                    : '';
                 return $this->progress(
                     $state,
                     $done,
                     $done
                         ? "Import completed! {$state['queries_count']} queries. WP replace: {$state['replace_count']} value(s)."
-                        : "Search & replace… {$state['replace_count']} value(s) updated"
+                        : "Search & replace… {$state['replace_count']} value(s) updated{$scanNote}"
                 );
             }
 
@@ -2131,12 +2210,7 @@ class DatabaseImporter
         $sql = fixSqlCollationCompatibility($sql);
 
         if (($state['search_old'] ?? '') !== '' && ($state['search_new'] ?? '') !== '' && empty($state['wp_search_replace'])) {
-            $sOld = (string) $state['search_old'];
-            $sNew = (string) $state['search_new'];
-            $sql = str_replace($sOld, $sNew, $sql);
-            if (substr($sOld, -1) === '/' && substr($sNew, -1) === '/' && strlen($sOld) > 1) {
-                $sql = str_replace(rtrim($sOld, '/'), rtrim($sNew, '/'), $sql);
-            }
+            $sql = (new SerializedSearchReplace((string) $state['search_old'], (string) $state['search_new']))->replace($sql);
         }
 
         if (!$this->db->query($sql)) {
@@ -2177,44 +2251,13 @@ class DatabaseImporter
         }
         while ($row = $res->fetch_row()) {
             $t = $row[0];
-            $meta = $this->describeTable($t);
+            $meta = describeReplaceTable($this->db, $t);
             if ($meta !== null) {
                 $out[] = $meta;
             }
         }
         $res->free();
         return $out;
-    }
-
-    private function describeTable(string $table): ?array
-    {
-        $safeT = escapeId($table);
-        $colsRes = $this->db->query("SHOW COLUMNS FROM {$safeT}");
-        if (!$colsRes) {
-            return null;
-        }
-        $pks = [];
-        $uniKeys = [];
-        $allCols = [];
-        $textCols = [];
-        while ($col = $colsRes->fetch_assoc()) {
-            $field = $col['Field'];
-            $allCols[] = $field;
-            if (($col['Key'] ?? '') === 'PRI') {
-                $pks[] = $field;
-            } elseif (($col['Key'] ?? '') === 'UNI') {
-                $uniKeys[] = $field;
-            }
-            if (preg_match('/char|text|blob|json|enum|set/i', (string) ($col['Type'] ?? ''))) {
-                $textCols[] = $field;
-            }
-        }
-        $colsRes->free();
-        if (!$textCols) {
-            return null;
-        }
-        $keys = $pks ?: ($uniKeys ?: $allCols);
-        return ['name' => $table, 'pks' => $keys, 'text' => $textCols];
     }
 
     private function replaceChunk(array $state, float $startTime, float $timeLimit): array
@@ -2617,44 +2660,13 @@ class DatabaseSearchReplacer
             if (!empty($filterTables) && !isset($allowed[$t])) {
                 continue;
             }
-            $meta = $this->describeTable($t);
+            $meta = describeReplaceTable($this->db, $t);
             if ($meta !== null) {
                 $out[] = $meta;
             }
         }
         $res->free();
         return $out;
-    }
-
-    private function describeTable(string $table): ?array
-    {
-        $safeT = escapeId($table);
-        $colsRes = $this->db->query("SHOW COLUMNS FROM {$safeT}");
-        if (!$colsRes) {
-            return null;
-        }
-        $pks = [];
-        $uniKeys = [];
-        $allCols = [];
-        $textCols = [];
-        while ($col = $colsRes->fetch_assoc()) {
-            $field = $col['Field'];
-            $allCols[] = $field;
-            if (($col['Key'] ?? '') === 'PRI') {
-                $pks[] = $field;
-            } elseif (($col['Key'] ?? '') === 'UNI') {
-                $uniKeys[] = $field;
-            }
-            if (preg_match('/char|text|blob|json|enum|set/i', (string) ($col['Type'] ?? ''))) {
-                $textCols[] = $field;
-            }
-        }
-        $colsRes->free();
-        if (!$textCols) {
-            return null;
-        }
-        $keys = $pks ?: ($uniKeys ?: $allCols);
-        return ['name' => $table, 'pks' => $keys, 'text' => $textCols];
     }
 
     private function saveState(array $state): void
