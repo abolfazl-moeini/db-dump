@@ -659,6 +659,23 @@ function escapeId(string $identifier): string
     return '`' . str_replace('`', '``', $identifier) . '`';
 }
 
+function formatSqlDumpValue($value, bool $isNumeric = false, bool $isBinary = false, ?mysqli $db = null): string
+{
+    if ($value === null) {
+        return 'NULL';
+    }
+    if ($isNumeric) {
+        return ($value === '') ? 'NULL' : (string) $value;
+    }
+    if ($isBinary) {
+        return ($value === '') ? "''" : ('0x' . bin2hex($value));
+    }
+    if ($db) {
+        return "'" . $db->real_escape_string((string) $value) . "'";
+    }
+    return "'" . addslashes((string) $value) . "'";
+}
+
 function safeBasename(string $name): string
 {
     $name = str_replace(["\0", '\\'], ["", '/'], $name);
@@ -1638,6 +1655,17 @@ function runSelfTests(): int
     $wrongCfg = ['password_hash' => '$2y$10$different_hash_value_here'];
     $_COOKIE = ['dbdump_auth' => $validCookieVal];
     $assert(verifyAuthCookie($wrongCfg) === false, 'verifyAuthCookie rejects cookie with different hash secret');
+
+    // Test formatSqlDumpValue
+    $assert(formatSqlDumpValue('', false, true) === "''", 'empty binary string formatted as empty string literal');
+    $assert(formatSqlDumpValue('test', false, true) === '0x74657374', 'non-empty binary formatted as hex');
+    $assert(formatSqlDumpValue(null, false, true) === 'NULL', 'null binary formatted as NULL');
+    $assert(formatSqlDumpValue(null, true, false) === 'NULL', 'null numeric formatted as NULL');
+    $assert(formatSqlDumpValue('', true, false) === 'NULL', 'empty numeric formatted as NULL');
+    $assert(formatSqlDumpValue('123', true, false) === '123', 'numeric value formatted as numeric string');
+    $assert(formatSqlDumpValue(0, true, false) === '0', 'zero numeric formatted as 0');
+    $assert(formatSqlDumpValue('0', true, false) === '0', 'zero string numeric formatted as 0');
+    $assert(formatSqlDumpValue("hello'world", false, false) === "'hello\\'world'", 'string value formatted and escaped');
 
     $_SESSION = $oldSession;
     $_COOKIE = $oldCookie;
@@ -3882,15 +3910,12 @@ class DatabaseExporter
 
             $vals = [];
             foreach ($row as $i => $value) {
-                if ($value === null) {
-                    $vals[] = 'NULL';
-                } elseif (!empty($cache['numeric'][$i])) {
-                    $vals[] = $value;
-                } elseif (!empty($cache['binary'][$i])) {
-                    $vals[] = '0x' . bin2hex($value);
-                } else {
-                    $vals[] = "'" . $this->db->real_escape_string($value) . "'";
-                }
+                $vals[] = formatSqlDumpValue(
+                    $value,
+                    !empty($cache['numeric'][$i]),
+                    !empty($cache['binary'][$i]),
+                    $this->db
+                );
             }
 
             $tuple = '(' . implode(',', $vals) . ')';
