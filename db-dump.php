@@ -9,49 +9,631 @@
  */
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  SAFETY LOCK: MAIN SITE (public_html) OVERWRITE PROTECTION
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// By default, operations that can drop, overwrite, or mutate the database of
+// the main WordPress site (located at public_html/wp-config.php or
+// public_html/{subdir}/wp-config.php) are COMPLETELY BLOCKED to protect live data.
+// To enable overwriting/restoring into the main site, change the constant below to true:
+if (!defined('ALLOW_MAIN_SITE_OVERWRITE')) {
+    define('ALLOW_MAIN_SITE_OVERWRITE', false);
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  PURE HELPERS (safe to load from CLI --self-test)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-function detectWpConfigDb(): array
+function isHttps(): bool
 {
-    $locations = [
-        __DIR__ . '/wp-config.php',
-        dirname(__DIR__) . '/wp-config.php',
-        dirname(__DIR__, 2) . '/wp-config.php',
+    $fwd = strtolower((string) ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? ''));
+    if ($fwd === 'https') {
+        return true;
+    }
+    if ($fwd === 'http') {
+        return false;
+    }
+    $cfVisitor = (string) ($_SERVER['HTTP_CF_VISITOR'] ?? '');
+    if ($cfVisitor !== '' && strpos($cfVisitor, '"scheme":"https"') !== false) {
+        return true;
+    }
+    if ($cfVisitor !== '' && strpos($cfVisitor, '"scheme":"http"') !== false) {
+        return false;
+    }
+    if (!empty($_SERVER['HTTPS']) && strtolower((string) $_SERVER['HTTPS']) !== 'off') {
+        return true;
+    }
+    if (strtolower((string) ($_SERVER['HTTP_X_FORWARDED_SSL'] ?? '')) === 'on') {
+        return true;
+    }
+    if (strtolower((string) ($_SERVER['HTTP_FRONT_END_HTTPS'] ?? '')) === 'on') {
+        return true;
+    }
+    if ((int) ($_SERVER['SERVER_PORT'] ?? 0) === 443) {
+        return true;
+    }
+    return false;
+}
+
+function scriptName(): string
+{
+    $name = $_SERVER['SCRIPT_NAME'] ?? '/db-dump.php';
+    $base = basename($name);
+    return $base !== '' ? $base : 'db-dump.php';
+}
+
+function redirectSelf(): void
+{
+    if (session_status() === PHP_SESSION_ACTIVE) {
+        session_write_close();
+    }
+    $uri = (string) ($_SERVER['REQUEST_URI'] ?? '');
+    if ($uri !== '') {
+        $clean = strtok($uri, '?');
+        if ($clean !== false && $clean !== '') {
+            header('Location: ' . $clean);
+            exit;
+        }
+    }
+    header('Location: ' . scriptName());
+    exit;
+}
+
+function isDirTrulyWritable(string $dir): bool
+{
+    if ($dir === '' || !@is_dir($dir)) {
+        return false;
+    }
+    $testFile = rtrim(str_replace('\\', '/', $dir), '/') . '/.dbd_probe_' . bin2hex(random_bytes(4));
+    $written = @file_put_contents($testFile, 'test');
+    if ($written === false) {
+        return false;
+    }
+    @unlink($testFile);
+    return true;
+}
+
+function ensureWritableSessionPath(): void
+{
+    $current = session_save_path();
+    $cleanPath = $current;
+    if ($current !== '' && strpos($current, ';') !== false) {
+        $parts = explode(';', $current);
+        $cleanPath = end($parts);
+    }
+    if ($cleanPath !== '' && isDirTrulyWritable($cleanPath)) {
+        return;
+    }
+    $candidates = [
+        sys_get_temp_dir(),
+        '/tmp',
+        __DIR__ . '/.dbdump_sessions',
     ];
-
-    foreach ($locations as $loc) {
-        if (!is_file($loc) || !is_readable($loc)) {
-            continue;
-        }
-        $content = file_get_contents($loc);
-        if ($content === false) {
-            continue;
-        }
-
-        $db = [];
-        foreach (['DB_NAME' => 'name', 'DB_USER' => 'user', 'DB_PASSWORD' => 'pass', 'DB_CHARSET' => 'charset'] as $const => $key) {
-            if (preg_match("/define\s*\(\s*['\"]" . $const . "['\"]\s*,\s*['\"](.*?)['\"]\s*\)/s", $content, $m)) {
-                $db[$key] = stripcslashes($m[1]);
+    foreach ($candidates as $dir) {
+        if ($dir === __DIR__ . '/.dbdump_sessions') {
+            if (!@is_dir($dir)) {
+                @mkdir($dir, 0700, true);
+                if (is_file($dir . '/.htaccess') === false) {
+                    @file_put_contents($dir . '/.htaccess', "Deny from all\n");
+                }
             }
         }
-        if (preg_match("/define\s*\(\s*['\"]DB_HOST['\"]\s*,\s*['\"](.*?)['\"]\s*\)/s", $content, $m)) {
-            $parsed = parseDbHost(stripcslashes($m[1]));
-            $db['host'] = $parsed['host'];
-            if ($parsed['port'] !== null) {
-                $db['port'] = $parsed['port'];
-            }
-            if ($parsed['socket'] !== null) {
-                $db['socket'] = $parsed['socket'];
-            }
+        if ($dir !== '' && isDirTrulyWritable($dir)) {
+            @session_save_path($dir);
+            return;
         }
+    }
+}
 
-        if (!empty($db['name']) && !empty($db['user'])) {
-            return $db;
+function startRobustSession(): bool
+{
+    if (PHP_SAPI === 'cli') {
+        return false;
+    }
+    if (session_status() === PHP_SESSION_ACTIVE) {
+        return true;
+    }
+
+    ensureWritableSessionPath();
+    $isSecure = isHttps();
+
+    @session_name('dbdump_sid');
+    if (PHP_VERSION_ID >= 70300) {
+        @session_set_cookie_params([
+            'lifetime' => 0,
+            'path'     => '/',
+            'domain'   => '',
+            'secure'   => $isSecure,
+            'httponly' => true,
+            'samesite' => 'Lax',
+        ]);
+    } else {
+        @session_set_cookie_params(0, '/', '', $isSecure, true);
+    }
+
+    $started = @session_start([
+        'name'            => 'dbdump_sid',
+        'cookie_httponly' => true,
+        'cookie_samesite' => 'Lax',
+        'cookie_secure'   => $isSecure,
+        'cookie_path'     => '/',
+        'use_strict_mode' => false,
+    ]);
+
+    if (!$started || session_status() !== PHP_SESSION_ACTIVE) {
+        $fallbacks = [
+            sys_get_temp_dir(),
+            '/tmp',
+            __DIR__ . '/.dbdump_sessions',
+        ];
+        foreach ($fallbacks as $dir) {
+            if ($dir === __DIR__ . '/.dbdump_sessions' && !@is_dir($dir)) {
+                @mkdir($dir, 0700, true);
+                if (is_file($dir . '/.htaccess') === false) {
+                    @file_put_contents($dir . '/.htaccess', "Deny from all\n");
+                }
+            }
+            if (isDirTrulyWritable($dir)) {
+                @session_save_path($dir);
+                $started = @session_start();
+                if ($started && session_status() === PHP_SESSION_ACTIVE) {
+                    break;
+                }
+            }
         }
     }
 
-    return [];
+    return session_status() === PHP_SESSION_ACTIVE;
+}
+
+function getAuthCookieSecret(array $config): string
+{
+    return hash('sha256', ($config['password_hash'] ?? '') . '|' . __FILE__);
+}
+
+function syncAuthCookie(array $config): void
+{
+    if (PHP_SAPI === 'cli' || headers_sent() || empty($config['password_hash'])) {
+        return;
+    }
+    $secret = getAuthCookieSecret($config);
+    $payload = time() . '|' . bin2hex(random_bytes(16));
+    $sig = hash_hmac('sha256', $payload, $secret);
+    $val = base64_encode($payload . '|' . $sig);
+    $isSecure = isHttps();
+    if (PHP_VERSION_ID >= 70300) {
+        @setcookie('dbdump_auth', $val, [
+            'expires'  => time() + 43200,
+            'path'     => '/',
+            'domain'   => '',
+            'secure'   => $isSecure,
+            'httponly' => true,
+            'samesite' => 'Lax',
+        ]);
+    } else {
+        @setcookie('dbdump_auth', $val, time() + 43200, '/; samesite=Lax', '', $isSecure, true);
+    }
+}
+
+function verifyAuthCookie(array $config): bool
+{
+    $val = (string) ($_COOKIE['dbdump_auth'] ?? '');
+    if ($val === '' || empty($config['password_hash'])) {
+        return false;
+    }
+    $raw = base64_decode($val, true);
+    if ($raw === false) {
+        return false;
+    }
+    $parts = explode('|', $raw);
+    if (count($parts) !== 3) {
+        return false;
+    }
+    [$loginTime, $nonce, $sig] = $parts;
+    $now = time();
+    if (($now - (int)$loginTime) > 43200) {
+        return false;
+    }
+    $secret = getAuthCookieSecret($config);
+    $expected = hash_hmac('sha256', $loginTime . '|' . $nonce, $secret);
+    return hash_equals($expected, $sig);
+}
+
+function syncCsrfCookie(): void
+{
+    if (PHP_SAPI === 'cli' || headers_sent()) {
+        return;
+    }
+    $token = (string) ($_SESSION['csrf_token'] ?? '');
+    if ($token !== '') {
+        $isSecure = isHttps();
+        setcookie('dbdump_csrf', $token, [
+            'expires'  => 0,
+            'path'     => '/',
+            'domain'   => '',
+            'secure'   => $isSecure,
+            'httponly' => true,
+            'samesite' => 'Lax',
+        ]);
+    }
+}
+
+function isValidCsrf(string $sent): bool
+{
+    if ($sent === '') {
+        return false;
+    }
+
+    // 1. Primary check: matches active session token
+    $sessionToken = (string) ($_SESSION['csrf_token'] ?? '');
+    if ($sessionToken !== '' && hash_equals($sessionToken, $sent)) {
+        return true;
+    }
+
+    // 2. Fallback check: Double-Submit Cookie
+    // If the server-side session file failed to persist on disk, but the browser
+    // returned the matching dbdump_csrf cookie set on initial page render:
+    $cookieToken = (string) ($_COOKIE['dbdump_csrf'] ?? '');
+    if ($cookieToken !== '' && hash_equals($cookieToken, $sent)) {
+        $_SESSION['csrf_token'] = $sent;
+        return true;
+    }
+
+    return false;
+}
+
+function getCsrfErrorMessage(): string
+{
+    if (empty($_COOKIE['dbdump_sid']) && empty($_COOKIE['dbdump_csrf'])) {
+        return 'Browser session cookie was not received. Please ensure cookies are allowed, or check if connecting via HTTP vs HTTPS.';
+    }
+    return 'Invalid form token. Refresh and try again.';
+}
+
+function isAllowMainSiteOverwrite(): bool
+{
+    if (defined('ALLOW_MAIN_SITE_OVERWRITE')) {
+        $val = constant('ALLOW_MAIN_SITE_OVERWRITE');
+        if ($val === true || $val === 1 || $val === 'true' || $val === '1') {
+            return true;
+        }
+    }
+    $envAllow = getenv('ALLOW_MAIN_SITE_OVERWRITE');
+    if ($envAllow === 'true' || $envAllow === '1') {
+        return true;
+    }
+    return false;
+}
+
+function isMainSiteWpPath(string $path): bool
+{
+    $normalized = str_replace('\\', '/', $path);
+    $real = str_replace('\\', '/', @realpath($path) ?: $normalized);
+
+    // 1. Matches public_html/wp-config.php or public_html/{subdir}/wp-config.php
+    if (preg_match('#(?:^|/)public_html(?:/[^/]+)?/wp-config\.php$#i', $normalized)
+        || preg_match('#(?:^|/)public_html(?:/[^/]+)?/wp-config\.php$#i', $real)) {
+        return true;
+    }
+
+    // 2. Matches any path with /public_html/
+    if (strpos($normalized, '/public_html/') !== false || strpos($normalized, 'public_html/') === 0
+        || strpos($real, '/public_html/') !== false || strpos($real, 'public_html/') === 0) {
+        return true;
+    }
+
+    // 3. Matches cPanel /www/ symlink which points to public_html
+    if (preg_match('#^/home\d*/[^/]+/www(?:/|$)#i', $normalized)
+        || preg_match('#^/home\d*/[^/]+/www(?:/|$)#i', $real)) {
+        return true;
+    }
+
+    // 4. Check document root if DOCUMENT_ROOT is or contains public_html
+    if (!empty($_SERVER['DOCUMENT_ROOT'])) {
+        $docRoot = str_replace('\\', '/', @realpath($_SERVER['DOCUMENT_ROOT']) ?: $_SERVER['DOCUMENT_ROOT']);
+        if (preg_match('#(?:^|/)public_html(?:/|$)#i', $docRoot)) {
+            if ($real === $docRoot . '/wp-config.php' || strpos($real, $docRoot . '/') === 0) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+function parseWpConfigFile(string $path): ?array
+{
+    if (!@is_file($path) || !@is_readable($path)) {
+        return null;
+    }
+    $content = @file_get_contents($path);
+    if ($content === false || $content === '') {
+        return null;
+    }
+
+    $db = [
+        'path'         => str_replace('\\', '/', $path),
+        'site_dir'     => str_replace('\\', '/', dirname($path)),
+        'name'         => '',
+        'user'         => '',
+        'pass'         => '',
+        'host'         => '127.0.0.1',
+        'port'         => 3306,
+        'socket'       => null,
+        'charset'      => 'utf8mb4',
+        'table_prefix' => 'wp_',
+        'is_main_site' => isMainSiteWpPath($path),
+    ];
+
+    $constants = [
+        'DB_NAME'     => 'name',
+        'DB_USER'     => 'user',
+        'DB_PASSWORD' => 'pass',
+        'DB_CHARSET'  => 'charset',
+    ];
+
+    foreach ($constants as $const => $key) {
+        if (preg_match("/define\s*\(\s*(['\"])" . $const . "\\1\s*,\s*(['\"])((?:(?!\\2)[^\\\\]|\\\\.)*)\\2\s*\)/s", $content, $m)) {
+            $db[$key] = stripcslashes($m[3]);
+        } elseif (preg_match("/define\s*\(\s*['\"]" . $const . "['\"]\s*,\s*['\"](.*?)['\"]\s*\)/s", $content, $m)) {
+            $db[$key] = stripcslashes($m[1]);
+        }
+    }
+
+    if (preg_match("/define\s*\(\s*(['\"])DB_HOST\\1\s*,\s*(['\"])((?:(?!\\2)[^\\\\]|\\\\.)*)\\2\s*\)/s", $content, $m)) {
+        $rawHost = stripcslashes($m[3]);
+    } elseif (preg_match("/define\s*\(\s*['\"]DB_HOST['\"]\s*,\s*['\"](.*?)['\"]\s*\)/s", $content, $m)) {
+        $rawHost = stripcslashes($m[1]);
+    } else {
+        $rawHost = '';
+    }
+
+    if ($rawHost !== '') {
+        $parsed = parseDbHost($rawHost);
+        $db['host'] = $parsed['host'];
+        if ($parsed['port'] !== null) {
+            $db['port'] = $parsed['port'];
+        }
+        if ($parsed['socket'] !== null) {
+            $db['socket'] = $parsed['socket'];
+        }
+    }
+
+    if (preg_match('/\$table_prefix\s*=\s*[\'"]([^\'"]+)[\'"]\s*;/', $content, $m)) {
+        $db['table_prefix'] = $m[1];
+    }
+
+    if (empty($db['name']) && empty($db['user'])) {
+        return null;
+    }
+
+    return $db;
+}
+
+function findCandidateWpPaths(?string $rootDir = null): array
+{
+    $candidates = [];
+    $scannedDirs = [];
+
+    $addCandidate = function (string $file) use (&$candidates) {
+        $normalized = str_replace('\\', '/', $file);
+        if (@is_file($normalized) && @is_readable($normalized)) {
+            $real = @realpath($normalized);
+            $key = $real !== false ? str_replace('\\', '/', $real) : $normalized;
+            $candidates[$key] = $normalized;
+        }
+    };
+
+    $scanSubdirs = function (string $dir, int $maxDepth = 2) use (&$scanSubdirs, $addCandidate, &$scannedDirs) {
+        if ($dir === '' || !@is_dir($dir) || !@is_readable($dir)) {
+            return;
+        }
+        $real = @realpath($dir);
+        if ($real === false) {
+            $real = str_replace('\\', '/', $dir);
+        } else {
+            $real = str_replace('\\', '/', $real);
+        }
+        if (isset($scannedDirs[$real])) {
+            return;
+        }
+        $scannedDirs[$real] = true;
+
+        $cfg = $real . '/wp-config.php';
+        if (@is_file($cfg)) {
+            $addCandidate($cfg);
+        }
+
+        if ($maxDepth <= 0) {
+            return;
+        }
+
+        $skipDirs = [
+            '.', '..', '.git', '.cpanel', '.trash', '.cagefs', '.subversion', '.ssh',
+            'mail', 'etc', 'ssl', 'logs', 'cpanel3-skel', 'tmp', 'access-logs',
+            'node_modules', 'wp-content', 'wp-includes', 'wp-admin', 'vendor', 'db_exports'
+        ];
+
+        $dh = @opendir($real);
+        if (!$dh) {
+            return;
+        }
+        $subDirs = [];
+        while (($entry = @readdir($dh)) !== false) {
+            if ($entry[0] === '.' || in_array(strtolower($entry), $skipDirs, true)) {
+                continue;
+            }
+            $full = $real . '/' . $entry;
+            if (@is_dir($full) && !@is_link($full)) {
+                $subDirs[] = $full;
+            }
+        }
+        @closedir($dh);
+
+        foreach ($subDirs as $sub) {
+            $scanSubdirs($sub, $maxDepth - 1);
+        }
+    };
+
+    if ($rootDir !== null) {
+        $scanSubdirs($rootDir, 3);
+        return array_values($candidates);
+    }
+
+    // 1. Current directory and immediate subdirectories / uploaded folders
+    $scanSubdirs(__DIR__, 2);
+
+    // 2. Parent directory (e.g. if db-dump is in a subfolder or root)
+    $parent = dirname(__DIR__);
+    if ($parent !== __DIR__) {
+        $scanSubdirs($parent, 2);
+    }
+    $grandParent = dirname($parent);
+    if ($grandParent !== $parent && $grandParent !== '/' && $grandParent !== '') {
+        $addCandidate($grandParent . '/wp-config.php');
+        $scanSubdirs($grandParent, 1);
+    }
+
+    // 3. Document root
+    if (!empty($_SERVER['DOCUMENT_ROOT'])) {
+        $docRoot = str_replace('\\', '/', @realpath($_SERVER['DOCUMENT_ROOT']) ?: $_SERVER['DOCUMENT_ROOT']);
+        $scanSubdirs($docRoot, 2);
+        $docParent = dirname($docRoot);
+        if ($docParent !== $docRoot && $docParent !== '/' && $docParent !== '') {
+            $scanSubdirs($docParent, 1);
+        }
+    }
+
+    // 4. cPanel / Linux hosting home directory resolution
+    $homeCandidates = [];
+    $detectHome = function (string $p) {
+        $p = str_replace('\\', '/', $p);
+        if (preg_match('#^(/home\d*/[^/]+)#i', $p, $m)) {
+            return $m[1];
+        }
+        if (preg_match('#^(/Users/[^/]+)#i', $p, $m)) {
+            return $m[1];
+        }
+        if (preg_match('#^(/var/www/(?:vhosts/)?[^/]+)#i', $p, $m)) {
+            return $m[1];
+        }
+        return null;
+    };
+
+    $h1 = $detectHome(__DIR__);
+    if ($h1) $homeCandidates[] = $h1;
+    if (!empty($_SERVER['DOCUMENT_ROOT'])) {
+        $h2 = $detectHome($_SERVER['DOCUMENT_ROOT']);
+        if ($h2) $homeCandidates[] = $h2;
+    }
+    if (!empty($_SERVER['HOME'])) {
+        $homeCandidates[] = $_SERVER['HOME'];
+    }
+    if (getenv('HOME')) {
+        $homeCandidates[] = getenv('HOME');
+    }
+    if (function_exists('posix_getpwuid') && function_exists('posix_geteuid')) {
+        $pw = @posix_getpwuid(@posix_geteuid());
+        if (!empty($pw['dir'])) {
+            $homeCandidates[] = $pw['dir'];
+        }
+    }
+
+    $homeCandidates = array_unique(array_filter($homeCandidates));
+    foreach ($homeCandidates as $home) {
+        if (!@is_dir($home) || !@is_readable($home)) {
+            continue;
+        }
+        // DirectAdmin check: /home/{user}/domains/*
+        if (@is_dir($home . '/domains')) {
+            $scanSubdirs($home . '/domains', 3);
+        }
+        // cPanel check: /home/{user}/public_html, /home/{user}/{dirname}
+        $scanSubdirs($home, 2);
+    }
+
+    return array_values($candidates);
+}
+
+function discoverWpConfigs(?string $rootDir = null): array
+{
+    $candidateFiles = findCandidateWpPaths($rootDir);
+    $discovered = [];
+
+    foreach ($candidateFiles as $file) {
+        $parsed = parseWpConfigFile($file);
+        if ($parsed === null) {
+            continue;
+        }
+
+        $path = $parsed['path'];
+        $isMain = $parsed['is_main_site'];
+        $dirName = basename($parsed['site_dir']);
+
+        if ($isMain) {
+            $label = (preg_match('#/public_html/wp-config\.php$#i', $path))
+                ? 'Main Site (public_html) [PROTECTED]'
+                : "Subsite ({$dirName}) [public_html - PROTECTED]";
+        } else {
+            $label = "Site ({$dirName})";
+        }
+
+        $parsed['label'] = $label;
+        $discovered[$path] = $parsed;
+    }
+
+    return $discovered;
+}
+
+function isMainSiteProtected(array $configOrSite, array $discoveredWp = []): bool
+{
+    if (isAllowMainSiteOverwrite()) {
+        return false;
+    }
+
+    if (!empty($configOrSite['is_main_site']) || !empty($configOrSite['active_wp_is_main'])) {
+        return true;
+    }
+
+    $targetDb = (string) ($configOrSite['name'] ?? $configOrSite['db_name'] ?? '');
+    if ($targetDb !== '') {
+        foreach ($discoveredWp as $wp) {
+            if (!empty($wp['is_main_site']) && ($wp['name'] ?? '') === $targetDb) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+function isDbNameMainSiteProtected(string $dbName, array $discoveredWp): bool
+{
+    if (isAllowMainSiteOverwrite() || $dbName === '') {
+        return false;
+    }
+    foreach ($discoveredWp as $wp) {
+        if (!empty($wp['is_main_site']) && ($wp['name'] ?? '') === $dbName) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function detectWpConfigDb(): array
+{
+    $discovered = discoverWpConfigs();
+    if (empty($discovered)) {
+        return [];
+    }
+    if (session_status() === PHP_SESSION_ACTIVE && !empty($_SESSION['selected_wp_path']) && isset($discovered[$_SESSION['selected_wp_path']])) {
+        return $discovered[$_SESSION['selected_wp_path']];
+    }
+    foreach ($discovered as $wp) {
+        if (!$wp['is_main_site']) {
+            return $wp;
+        }
+    }
+    return reset($discovered);
 }
 
 function parseDbHost(string $raw): array
@@ -950,6 +1532,116 @@ function runSelfTests(): int
     $assert($schemeReplacer->replace('http://old-domain.local/contact') === 'https://new-domain.com/contact', 'https search also replaces http URLs');
     $assert($schemeReplacer->hasMatch('http://old-domain.local') === true, 'https search matches http host without trailing slash');
 
+    // Test isMainSiteWpPath
+    $assert(isMainSiteWpPath('/home/cpuser/public_html/wp-config.php') === true, 'detect public_html main site');
+    $assert(isMainSiteWpPath('/home/cpuser/public_html/shop/wp-config.php') === true, 'detect public_html subfolder');
+    $assert(isMainSiteWpPath('/home/cpuser/public_html/en/wp-config.php') === true, 'detect public_html lang subfolder');
+    $assert(isMainSiteWpPath('public_html/wp-config.php') === true, 'detect relative public_html');
+    $assert(isMainSiteWpPath('/home/cpuser/staging/wp-config.php') === false, 'staging site is not main site');
+    $assert(isMainSiteWpPath('/home/cpuser/my_uploaded_folder/wp-config.php') === false, 'uploaded site is not main site');
+    $assert(isMainSiteWpPath('/var/www/staging/wp-config.php') === false, 'var www staging is not main site');
+
+    // Test parseWpConfigFile and discoverWpConfigs
+    $tmpDir = sys_get_temp_dir() . '/wp_cfg_test_' . uniqid();
+    @mkdir($tmpDir . '/public_html', 0777, true);
+    @mkdir($tmpDir . '/staging', 0777, true);
+    file_put_contents($tmpDir . '/public_html/wp-config.php', "<?php\ndefine('DB_NAME', 'live_db');\ndefine('DB_USER', 'live_usr');\ndefine('DB_PASSWORD', 'live_pass');\ndefine('DB_HOST', 'localhost:3308');\n\$table_prefix = 'wp_live_';\n");
+    file_put_contents($tmpDir . '/staging/wp-config.php', "<?php\ndefine('DB_NAME', 'stage_db');\ndefine('DB_USER', 'stage_usr');\ndefine('DB_PASSWORD', 'stage_pass');\ndefine('DB_HOST', '127.0.0.1');\n\$table_prefix = 'wp_stage_';\n");
+
+    $liveCfg = parseWpConfigFile($tmpDir . '/public_html/wp-config.php');
+    $assert($liveCfg !== null && $liveCfg['name'] === 'live_db' && $liveCfg['port'] === 3308 && $liveCfg['is_main_site'] === true, 'parse live wp-config correctly');
+
+    $stageCfg = parseWpConfigFile($tmpDir . '/staging/wp-config.php');
+    $assert($stageCfg !== null && $stageCfg['name'] === 'stage_db' && $stageCfg['table_prefix'] === 'wp_stage_' && $stageCfg['is_main_site'] === false, 'parse staging wp-config correctly');
+
+    $scanned = discoverWpConfigs($tmpDir);
+    $assert(count($scanned) === 2, 'discover all wp configs in directory tree');
+
+    // Test protection logic
+    $assert(isMainSiteProtected($liveCfg, $scanned) === true, 'live site in public_html is protected by default');
+    $assert(isMainSiteProtected($stageCfg, $scanned) === false, 'staging site is not protected by default');
+    $assert(isDbNameMainSiteProtected('live_db', $scanned) === true, 'live_db name is recognized as protected');
+    $assert(isDbNameMainSiteProtected('stage_db', $scanned) === false, 'stage_db name is not protected');
+
+    // Test unlock via ALLOW_MAIN_SITE_OVERWRITE
+    putenv('ALLOW_MAIN_SITE_OVERWRITE=1');
+    $assert(isMainSiteProtected($liveCfg, $scanned) === false, 'live site can be unlocked when ALLOW_MAIN_SITE_OVERWRITE is 1');
+    $assert(isDbNameMainSiteProtected('live_db', $scanned) === false, 'live_db can be unlocked when ALLOW_MAIN_SITE_OVERWRITE is 1');
+    putenv('ALLOW_MAIN_SITE_OVERWRITE=0');
+    $assert(isMainSiteProtected($liveCfg, $scanned) === true, 'live site is locked again when ALLOW_MAIN_SITE_OVERWRITE is 0');
+    putenv('ALLOW_MAIN_SITE_OVERWRITE');
+
+    // Clean up temp test files
+    @unlink($tmpDir . '/public_html/wp-config.php');
+    @rmdir($tmpDir . '/public_html');
+    @unlink($tmpDir . '/staging/wp-config.php');
+    @rmdir($tmpDir . '/staging');
+    @rmdir($tmpDir);
+    // Test isHttps logic
+    $oldServer = $_SERVER;
+    $_SERVER = [];
+    $assert(isHttps() === false, 'isHttps defaults to false');
+    $_SERVER['HTTPS'] = 'on';
+    $assert(isHttps() === true, 'isHttps detects HTTPS=on');
+    $_SERVER['HTTPS'] = 'off';
+    $assert(isHttps() === false, 'isHttps handles HTTPS=off');
+    $_SERVER['HTTP_X_FORWARDED_PROTO'] = 'https';
+    $assert(isHttps() === true, 'isHttps detects HTTP_X_FORWARDED_PROTO=https');
+    $_SERVER['HTTP_X_FORWARDED_PROTO'] = 'http';
+    $_SERVER['SERVER_PORT'] = '443';
+    $assert(isHttps() === false, 'isHttps respects HTTP_X_FORWARDED_PROTO=http even when SERVER_PORT is 443');
+    $_SERVER = ['HTTP_CF_VISITOR' => '{"scheme":"https"}'];
+    $assert(isHttps() === true, 'isHttps detects Cloudflare HTTPS visitor');
+    $_SERVER = ['HTTP_CF_VISITOR' => '{"scheme":"http"}', 'SERVER_PORT' => '443'];
+    $assert(isHttps() === false, 'isHttps detects Cloudflare HTTP visitor even on 443 origin');
+    $_SERVER = $oldServer;
+
+    // Test isValidCsrf and fallback
+    $oldSession = $_SESSION ?? [];
+    $oldCookie = $_COOKIE ?? [];
+    $_SESSION = ['csrf_token' => 'token_alpha'];
+    $_COOKIE = [];
+    $assert(isValidCsrf('token_alpha') === true, 'isValidCsrf matches session token');
+    $assert(isValidCsrf('wrong_token') === false, 'isValidCsrf rejects invalid session token');
+    $assert(isValidCsrf('') === false, 'isValidCsrf rejects empty token');
+
+    // Test Double-Submit Cookie fallback (when session is lost on shared hosting)
+    $_SESSION = ['csrf_token' => 'new_random_token_generated_by_server'];
+    $_COOKIE = ['dbdump_csrf' => 'token_stored_in_cookie'];
+    $assert(isValidCsrf('token_stored_in_cookie') === true, 'isValidCsrf accepts double-submit cookie fallback');
+    $assert($_SESSION['csrf_token'] === 'token_stored_in_cookie', 'isValidCsrf restores matching token into session');
+
+    // Test getCsrfErrorMessage
+    $_COOKIE = [];
+    $assert(strpos(getCsrfErrorMessage(), 'cookie') !== false, 'getCsrfErrorMessage detects missing cookies');
+    $_COOKIE = ['dbdump_sid' => '123'];
+    $assert(strpos(getCsrfErrorMessage(), 'Invalid form token') !== false, 'getCsrfErrorMessage reports token error when cookies exist');
+    // Test isDirTrulyWritable
+    $assert(isDirTrulyWritable(sys_get_temp_dir()) === true, 'isDirTrulyWritable detects temp dir is writable');
+    $assert(isDirTrulyWritable('/non_existent_directory_abc123') === false, 'isDirTrulyWritable rejects non-existent dir');
+
+    // Test verifyAuthCookie fallback
+    $dummyCfg = ['password_hash' => '$2y$10$abcdefghijklmnopqrstuu'];
+    $secret = getAuthCookieSecret($dummyCfg);
+    $payload = time() . '|' . bin2hex(random_bytes(16));
+    $validCookieVal = base64_encode($payload . '|' . hash_hmac('sha256', $payload, $secret));
+    $_COOKIE = ['dbdump_auth' => $validCookieVal];
+    $assert(verifyAuthCookie($dummyCfg) === true, 'verifyAuthCookie validates correct signed cookie');
+    $assert(isAuthenticated($dummyCfg) === true, 'isAuthenticated succeeds via auth cookie fallback');
+
+    // Test verifyAuthCookie with tampered payload
+    $tamperedCookieVal = base64_encode($payload . '_tampered|' . hash_hmac('sha256', $payload, $secret));
+    $_COOKIE = ['dbdump_auth' => $tamperedCookieVal];
+    $assert(verifyAuthCookie($dummyCfg) === false, 'verifyAuthCookie rejects tampered cookie');
+
+    // Test verifyAuthCookie with wrong password hash
+    $wrongCfg = ['password_hash' => '$2y$10$different_hash_value_here'];
+    $_COOKIE = ['dbdump_auth' => $validCookieVal];
+    $assert(verifyAuthCookie($wrongCfg) === false, 'verifyAuthCookie rejects cookie with different hash secret');
+
+    $_SESSION = $oldSession;
+    $_COOKIE = $oldCookie;
+
     echo "\n{$ok} passed, {$fail} failed\n";
     return $fail === 0 ? 0 : 1;
 }
@@ -974,7 +1666,29 @@ ini_set('log_errors', '1');
 ini_set('memory_limit', '512M');
 error_reporting(E_ALL);
 
-$wpDb = detectWpConfigDb();
+if (PHP_SAPI !== 'cli') {
+    if (!headers_sent()) {
+        header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+        header('Pragma: no-cache');
+        header('Expires: 0');
+        header('X-LiteSpeed-Cache-Control: no-cache');
+    }
+
+    if (session_status() === PHP_SESSION_NONE) {
+        startRobustSession();
+    }
+}
+
+if (empty($_SESSION['csrf_token'])) {
+    if (!empty($_COOKIE['dbdump_csrf']) && strlen((string)$_COOKIE['dbdump_csrf']) === 64) {
+        $_SESSION['csrf_token'] = (string) $_COOKIE['dbdump_csrf'];
+    } else {
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    }
+}
+
+syncCsrfCookie();
+
 $authFile = __DIR__ . '/db-dump-auth.php';
 
 function loadLocalAuthHash(string $authFile): string
@@ -1015,16 +1729,43 @@ PHP;
 $envHash = getenv('DB_EXPORT_PASSWORD_HASH');
 $envToken = getenv('DB_EXPORT_TOKEN');
 
+// Auto-discover WordPress installations
+$discoveredWp = discoverWpConfigs();
+if (isset($_GET['switch_wp']) && isset($discoveredWp[$_GET['switch_wp']])) {
+    $_SESSION['selected_wp_path'] = (string) $_GET['switch_wp'];
+}
+
+$activeWpPath = null;
+if (session_status() === PHP_SESSION_ACTIVE && !empty($_SESSION['selected_wp_path']) && isset($discoveredWp[$_SESSION['selected_wp_path']])) {
+    $activeWpPath = $_SESSION['selected_wp_path'];
+} else {
+    // Prefer non-main site (e.g. uploaded/staging folder) to prevent accidental production overwrite
+    foreach ($discoveredWp as $p => $wp) {
+        if (!$wp['is_main_site']) {
+            $activeWpPath = $p;
+            break;
+        }
+    }
+    if ($activeWpPath === null && !empty($discoveredWp)) {
+        $activeWpPath = array_key_first($discoveredWp);
+    }
+}
+
+$activeWp = ($activeWpPath !== null) ? $discoveredWp[$activeWpPath] : [];
+if ($activeWpPath !== null && session_status() === PHP_SESSION_ACTIVE) {
+    $_SESSION['selected_wp_path'] = $activeWpPath;
+}
+
 $config = [
     'password_hash'    => (is_string($envHash) && $envHash !== '') ? $envHash : loadLocalAuthHash($authFile),
     'auth_token'       => (is_string($envToken) && $envToken !== '') ? $envToken : '',
-    'db_host'          => getenv('DB_HOST') ?: getenv('WORDPRESS_DB_HOST') ?: ($wpDb['host'] ?? '127.0.0.1'),
-    'db_name'          => getenv('DB_NAME') ?: getenv('WORDPRESS_DB_NAME') ?: ($wpDb['name'] ?? ''),
-    'db_user'          => getenv('DB_USER') ?: getenv('WORDPRESS_DB_USER') ?: ($wpDb['user'] ?? ''),
-    'db_pass'          => getenv('DB_PASS') ?: getenv('WORDPRESS_DB_PASSWORD') ?: ($wpDb['pass'] ?? ''),
-    'db_charset'       => $wpDb['charset'] ?? 'utf8mb4',
-    'db_port'          => (int) (getenv('DB_PORT') ?: ($wpDb['port'] ?? 3306)),
-    'db_socket'        => $wpDb['socket'] ?? null,
+    'db_host'          => getenv('DB_HOST') ?: getenv('WORDPRESS_DB_HOST') ?: ($activeWp['host'] ?? '127.0.0.1'),
+    'db_name'          => getenv('DB_NAME') ?: getenv('WORDPRESS_DB_NAME') ?: ($activeWp['name'] ?? ''),
+    'db_user'          => getenv('DB_USER') ?: getenv('WORDPRESS_DB_USER') ?: ($activeWp['user'] ?? ''),
+    'db_pass'          => getenv('DB_PASS') ?: getenv('WORDPRESS_DB_PASSWORD') ?: ($activeWp['pass'] ?? ''),
+    'db_charset'       => $activeWp['charset'] ?? 'utf8mb4',
+    'db_port'          => (int) (getenv('DB_PORT') ?: ($activeWp['port'] ?? 3306)),
+    'db_socket'        => $activeWp['socket'] ?? null,
     'dest_db_host'     => getenv('DEST_DB_HOST') ?: '127.0.0.1',
     'dest_db_name'     => getenv('DEST_DB_NAME') ?: '',
     'dest_db_user'     => getenv('DEST_DB_USER') ?: '',
@@ -1040,6 +1781,11 @@ $config = [
     'export_triggers'  => true,
     'compression'      => 'gzip',
     'auth_file'        => $authFile,
+    'active_wp_path'   => $activeWpPath,
+    'active_wp_is_main'=> !empty($activeWp['is_main_site']),
+    'active_wp_label'  => $activeWp['label'] ?? '',
+    'table_prefix'     => $activeWp['table_prefix'] ?? 'wp_',
+    'allow_main_site_overwrite' => isAllowMainSiteOverwrite(),
 ];
 
 $hostParsed = parseDbHost((string) $config['db_host']);
@@ -1052,26 +1798,9 @@ if ($hostParsed['socket'] !== null && empty($config['db_socket'])) {
     $config['db_socket'] = $hostParsed['socket'];
 }
 
+$isMainProtected = isMainSiteProtected($config, $discoveredWp);
+
 set_time_limit($config['time_limit'] + 30);
-
-function isHttps(): bool
-{
-    if (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') {
-        return true;
-    }
-    if ((int) ($_SERVER['SERVER_PORT'] ?? 0) === 443) {
-        return true;
-    }
-    $fwd = strtolower((string) ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? ''));
-    return $fwd === 'https';
-}
-
-function scriptName(): string
-{
-    $name = $_SERVER['SCRIPT_NAME'] ?? '/db-dump.php';
-    $base = basename($name);
-    return $base !== '' ? $base : 'db-dump.php';
-}
 
 function decodeStateB64($encoded): string
 {
@@ -1167,24 +1896,6 @@ function dbConnect(array $config, ?string $host = null, ?string $user = null, ?s
     return $db;
 }
 
-if (session_status() === PHP_SESSION_NONE) {
-    $cookiePath = rtrim(str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'] ?? '/')), '/') . '/';
-    if ($cookiePath === '//') {
-        $cookiePath = '/';
-    }
-    session_start([
-        'name'            => 'dbdump_sid',
-        'cookie_httponly' => true,
-        'cookie_samesite' => 'Strict',
-        'cookie_secure'   => isHttps(),
-        'cookie_path'     => $cookiePath,
-        'use_strict_mode' => true,
-    ]);
-}
-
-if (empty($_SESSION['csrf_token'])) {
-    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
-}
 
 if (!is_dir($config['export_dir'])) {
     if (!@mkdir($config['export_dir'], 0750, true) && !is_dir($config['export_dir'])) {
@@ -1246,6 +1957,12 @@ function isAuthenticated(array $config): bool
         $_SESSION['login_time'] = $now;
         return true;
     }
+    if (verifyAuthCookie($config)) {
+        $_SESSION['logged_in'] = true;
+        $_SESSION['login_time'] = time();
+        $_SESSION['login_started'] = time();
+        return true;
+    }
     return isTokenAuth($config);
 }
 
@@ -1265,8 +1982,7 @@ function requireCsrf(array $config): void
     if ($sent === '') {
         $sent = (string) ($_POST['csrf_token'] ?? '');
     }
-    $expected = (string) ($_SESSION['csrf_token'] ?? '');
-    if ($expected === '' || $sent === '' || !hash_equals($expected, $sent)) {
+    if (!isValidCsrf($sent)) {
         jsonExit(['error' => 'Invalid or missing CSRF token'], 403);
     }
 }
@@ -1280,19 +1996,26 @@ function requirePost(): void
 
 function sessionLogin(): void
 {
-    session_regenerate_id(true);
+    global $config;
+    if (session_status() === PHP_SESSION_ACTIVE) {
+        @session_regenerate_id(true);
+    }
     $_SESSION['logged_in'] = true;
     $_SESSION['login_time'] = time();
     $_SESSION['login_started'] = time();
     $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    syncCsrfCookie();
+    if (is_array($config) && !empty($config['password_hash'])) {
+        syncAuthCookie($config);
+    }
 }
 
 $requestMethod = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
 
 if ($requestMethod === 'POST' && isset($_POST['setup_password'])) {
     $csrf = (string) ($_POST['csrf_token'] ?? '');
-    if ($csrf === '' || !hash_equals((string) $_SESSION['csrf_token'], $csrf)) {
-        $loginError = 'Invalid form token. Refresh and try again.';
+    if (!isValidCsrf($csrf)) {
+        $loginError = getCsrfErrorMessage();
     } elseif (!$needsSetup) {
         $loginError = 'A password is already configured.';
     } else {
@@ -1309,8 +2032,7 @@ if ($requestMethod === 'POST' && isset($_POST['setup_password'])) {
                 $config['password_hash'] = $hash;
                 $needsSetup = false;
                 sessionLogin();
-                header('Location: ' . scriptName());
-                exit;
+                redirectSelf();
             } catch (Throwable $e) {
                 $loginError = $e->getMessage();
             }
@@ -1318,8 +2040,8 @@ if ($requestMethod === 'POST' && isset($_POST['setup_password'])) {
     }
 } elseif ($requestMethod === 'POST' && isset($_POST['password'])) {
     $csrf = (string) ($_POST['csrf_token'] ?? '');
-    if ($csrf === '' || !hash_equals((string) $_SESSION['csrf_token'], $csrf)) {
-        $loginError = 'Invalid form token. Refresh and try again.';
+    if (!isValidCsrf($csrf)) {
+        $loginError = getCsrfErrorMessage();
     } elseif ($needsSetup) {
         $loginError = 'Set a password first.';
     } elseif (!password_verify((string) $_POST['password'], $config['password_hash'])) {
@@ -1327,25 +2049,28 @@ if ($requestMethod === 'POST' && isset($_POST['setup_password'])) {
         usleep(400000);
     } else {
         sessionLogin();
-        header('Location: ' . scriptName());
-        exit;
+        redirectSelf();
     }
 }
 
 if (isset($_GET['logout'])) {
     if ($requestMethod === 'POST') {
         $csrf = (string) ($_POST['csrf_token'] ?? '');
-        if ($csrf !== '' && hash_equals((string) ($_SESSION['csrf_token'] ?? ''), $csrf)) {
+        if (isValidCsrf($csrf)) {
             $_SESSION = [];
             if (ini_get('session.use_cookies')) {
                 $p = session_get_cookie_params();
                 setcookie(session_name(), '', time() - 42000, $p['path'], $p['domain'], $p['secure'], $p['httponly']);
             }
-            session_destroy();
+            setcookie('dbdump_csrf', '', time() - 42000, '/');
+            setcookie('dbdump_auth', '', time() - 42000, '/');
+            if (session_status() === PHP_SESSION_ACTIVE) {
+                session_destroy();
+            }
+            redirectSelf();
         }
     }
-    header('Location: ' . scriptName());
-    exit;
+    redirectSelf();
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1643,6 +2368,10 @@ if (isset($_GET['action']) && in_array($_GET['action'], ['copy_table_chunk', 'fi
             jsonExit(['error' => 'Missing destination database credentials or table'], 400);
         }
 
+        if (isDbNameMainSiteProtected($destName, $discoveredWp)) {
+            jsonExit(['error' => 'Security Error: Direct Copy into the main site database (' . $destName . ') is completely disabled because it belongs to public_html. Set ALLOW_MAIN_SITE_OVERWRITE = true in db-dump.php to unlock.'], 403);
+        }
+
         try {
             $srcDb = dbConnect($config);
             $destDb = dbConnect($config, $destHost, $destUser, $destPass, $destName, $destPort);
@@ -1738,6 +2467,9 @@ if (isset($_GET['action']) && in_array($_GET['action'], ['copy_table_chunk', 'fi
     }
 
     if ($_GET['action'] === 'finalize_copy') {
+        if (isDbNameMainSiteProtected($destName, $discoveredWp)) {
+            jsonExit(['error' => 'Security Error: Direct Copy into the main site database (' . $destName . ') is completely disabled because it belongs to public_html. Set ALLOW_MAIN_SITE_OVERWRITE = true in db-dump.php to unlock.'], 403);
+        }
         try {
             $srcDb = dbConnect($config);
             $destDb = dbConnect($config, $destHost, $destUser, $destPass, $destName, $destPort);
@@ -3425,7 +4157,7 @@ if (isset($_GET['action'])) {
     requireAuth($config);
 
     $action = (string) $_GET['action'];
-    $mutating = ['init', 'process', 'init_import', 'process_import', 'init_replace', 'process_replace', 'destroy'];
+    $mutating = ['init', 'process', 'init_import', 'process_import', 'init_replace', 'process_replace', 'destroy', 'switch_wp'];
     if (in_array($action, $mutating, true)) {
         requirePost();
         requireCsrf($config);
@@ -3439,6 +4171,84 @@ if (isset($_GET['action'])) {
     $replaceLockFile  = $config['export_dir'] . 'replace.lock';
 
     try {
+        if ($action === 'switch_wp') {
+            $input = json_decode((string) file_get_contents('php://input'), true) ?: [];
+            $path = (string) ($input['path'] ?? $_GET['path'] ?? '');
+            $discovered = discoverWpConfigs();
+            if (!isset($discovered[$path])) {
+                jsonExit(['error' => 'Selected WordPress installation was not found.'], 404);
+            }
+            $_SESSION['selected_wp_path'] = $path;
+            $site = $discovered[$path];
+
+            $testConfig = $config;
+            $testConfig['db_name'] = $site['name'];
+            $testConfig['db_user'] = $site['user'];
+            $testConfig['db_pass'] = $site['pass'];
+            $testConfig['db_host'] = $site['host'];
+            $testConfig['db_port'] = $site['port'];
+            $testConfig['db_socket'] = $site['socket'];
+            $testConfig['active_wp_is_main'] = !empty($site['is_main_site']);
+
+            $isProt = isMainSiteProtected($testConfig, $discovered);
+            $tables = [];
+            $connError = null;
+
+            try {
+                $testDb = dbConnect($testConfig);
+                $res = $testDb->query("SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'");
+                if ($res) {
+                    while ($row = $res->fetch_row()) {
+                        $tables[] = $row[0];
+                    }
+                    $res->free();
+                }
+                $testDb->close();
+            } catch (Throwable $e) {
+                $connError = $e->getMessage();
+            }
+
+            jsonExit([
+                'success'    => true,
+                'selected'   => $path,
+                'site'       => [
+                    'name'         => $site['name'],
+                    'user'         => $site['user'],
+                    'host'         => $site['host'],
+                    'port'         => $site['port'],
+                    'label'        => $site['label'],
+                    'is_main_site' => $site['is_main_site'],
+                    'path'         => $site['path'],
+                ],
+                'tables'     => $tables,
+                'conn_error' => $connError,
+                'protected'  => $isProt,
+                'allow_overwrite' => isAllowMainSiteOverwrite(),
+            ]);
+        }
+        if ($action === 'rescan_wp') {
+            $discovered = discoverWpConfigs();
+            $currActive = $_SESSION['selected_wp_path'] ?? null;
+            if ($currActive === null || !isset($discovered[$currActive])) {
+                foreach ($discovered as $p => $wp) {
+                    if (!$wp['is_main_site']) {
+                        $currActive = $p;
+                        break;
+                    }
+                }
+                if ($currActive === null && !empty($discovered)) {
+                    $currActive = array_key_first($discovered);
+                }
+                if ($currActive !== null) {
+                    $_SESSION['selected_wp_path'] = $currActive;
+                }
+            }
+            jsonExit([
+                'success' => true,
+                'sites'   => array_values($discovered),
+                'active'  => $currActive,
+            ]);
+        }
         if ($action === 'init') {
             $input = json_decode((string) file_get_contents('php://input'), true) ?: [];
             $exporter = new DatabaseExporter($config, $exportStateFile, $exportLockFile);
@@ -3449,20 +4259,40 @@ if (isset($_GET['action'])) {
             jsonExit($exporter->processChunk());
         }
         if ($action === 'init_import') {
+            if (isMainSiteProtected($config, $discoveredWp)) {
+                jsonExit([
+                    'error' => 'Security Error: Overwriting or restoring into the main site database (' . ($config['db_name'] ?? '') . ') is completely disabled because it is located in public_html. To unlock, edit db-dump.php and set: define(\'ALLOW_MAIN_SITE_OVERWRITE\', true);'
+                ], 403);
+            }
             $input = json_decode((string) file_get_contents('php://input'), true) ?: [];
             $importer = new DatabaseImporter($config, $importStateFile, $importLockFile);
             jsonExit($importer->init($input));
         }
         if ($action === 'process_import') {
+            if (isMainSiteProtected($config, $discoveredWp)) {
+                jsonExit(['error' => 'Security Error: Import blocked on main site database.'], 403);
+            }
             $importer = new DatabaseImporter($config, $importStateFile, $importLockFile);
             jsonExit($importer->processChunk());
         }
         if ($action === 'init_replace') {
             $input = json_decode((string) file_get_contents('php://input'), true) ?: [];
+            $isDryRun = !empty($input['dry_run']);
+            if (!$isDryRun && isMainSiteProtected($config, $discoveredWp)) {
+                jsonExit([
+                    'error' => 'Security Error: Live Search & Replace on the main site database (' . ($config['db_name'] ?? '') . ') is completely disabled because it is located in public_html. You can run Dry Run preview, or set define(\'ALLOW_MAIN_SITE_OVERWRITE\', true); in db-dump.php to unlock.'
+                ], 403);
+            }
             $replacer = new DatabaseSearchReplacer($config, $replaceStateFile, $replaceLockFile);
             jsonExit($replacer->init($input));
         }
         if ($action === 'process_replace') {
+            if (is_file($replaceStateFile)) {
+                $rState = json_decode((string) file_get_contents($replaceStateFile), true);
+                if (is_array($rState) && empty($rState['dry_run']) && isMainSiteProtected($config, $discoveredWp)) {
+                    jsonExit(['error' => 'Security Error: Live Search & Replace write blocked on main site database.'], 403);
+                }
+            }
             $replacer = new DatabaseSearchReplacer($config, $replaceStateFile, $replaceLockFile);
             jsonExit($replacer->processChunk());
         }
@@ -3489,7 +4319,7 @@ header('Referrer-Policy: no-referrer');
 header('Cache-Control: no-store, no-cache, must-revalidate');
 header('Pragma: no-cache');
 header("Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'self'; img-src 'self' data:");
-$csrf = htmlspecialchars((string) $_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8');
+$csrf = htmlspecialchars((string) ($_SESSION['csrf_token'] ?? ($_COOKIE['dbdump_csrf'] ?? '')), ENT_QUOTES, 'UTF-8');
 $self = htmlspecialchars(scriptName(), ENT_QUOTES, 'UTF-8');
 ?>
 <!DOCTYPE html>
@@ -3535,6 +4365,37 @@ $self = htmlspecialchars(scriptName(), ENT_QUOTES, 'UTF-8');
             font-size: 12px;
             font-weight: 600;
             white-space: nowrap;
+        }
+        .badge-danger {
+            background: #fee2e2;
+            color: #991b1b;
+            border: 1px solid #fca5a5;
+        }
+        .badge-warning {
+            background: #fef3c7;
+            color: #92400e;
+            border: 1px solid #fcd34d;
+        }
+        .badge-success {
+            background: #dcfce7;
+            color: #166534;
+            border: 1px solid #86efac;
+        }
+        .wp-card {
+            background: #f8fafc;
+            border: 1.5px solid #e2e8f0;
+            border-radius: 12px;
+            padding: 14px 16px;
+            margin-bottom: 20px;
+        }
+        .wp-card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+            font-size: 13px;
+            font-weight: 700;
+            color: #1e293b;
         }
         .logout {
             color: #ef4444;
@@ -3750,14 +4611,76 @@ $self = htmlspecialchars(scriptName(), ENT_QUOTES, 'UTF-8');
             <div class="header">
                 <h1>
                     Database Tool
-                    <span class="badge"><?= htmlspecialchars($config['db_name'] ?: 'No DB Selected', ENT_QUOTES, 'UTF-8') ?></span>
+                    <span class="badge" id="headerDbBadge"><?= htmlspecialchars($config['db_name'] ?: 'No DB Selected', ENT_QUOTES, 'UTF-8') ?></span>
+                    <?php if ($isMainProtected): ?>
+                        <span class="badge badge-danger" id="headerProtectedBadge" title="Protected: public_html WordPress database">🛡️ MAIN SITE PROTECTED</span>
+                    <?php endif; ?>
                 </h1>
                 <form method="POST" action="<?= $self ?>?logout=1" style="margin:0;">
                     <input type="hidden" name="csrf_token" value="<?= $csrf ?>">
                     <button type="submit" class="logout">Logout</button>
                 </form>
             </div>
-            <div class="subtitle">Connected to <?= htmlspecialchars((string) $config['db_host'], ENT_QUOTES, 'UTF-8') ?>:<?= (int) $config['db_port'] ?></div>
+            <div class="subtitle" id="headerSubtitle">Connected to <?= htmlspecialchars((string) $config['db_host'], ENT_QUOTES, 'UTF-8') ?>:<?= (int) $config['db_port'] ?><?= !empty($config['active_wp_label']) ? ' • ' . htmlspecialchars($config['active_wp_label'], ENT_QUOTES, 'UTF-8') : '' ?></div>
+
+            <div class="wp-card">
+                <div class="wp-card-header">
+                    <span>🔌 WordPress Auto-Discovery (<span id="wpSitesCountSpan"><?= count($discoveredWp) ?> installation<?= count($discoveredWp) === 1 ? '' : 's' ?></span> found)</span>
+                    <button type="button" class="btn-sm btn-secondary" id="rescanWpBtn" style="padding: 4px 10px; font-size: 11px;">🔄 Rescan Server</button>
+                </div>
+                <div id="wpSitesContainer">
+                <?php if (!empty($discoveredWp)): ?>
+                    <div style="display: flex; gap: 8px; align-items: center;">
+                        <select id="wpSiteSelect" style="flex: 1;">
+                            <?php foreach ($discoveredWp as $p => $wp): ?>
+                                <option value="<?= htmlspecialchars($p, ENT_QUOTES, 'UTF-8') ?>" <?= ($p === ($config['active_wp_path'] ?? '')) ? 'selected' : '' ?>>
+                                    <?= $wp['is_main_site'] ? '🛡️ ' : '📁 ' ?>
+                                    <?= htmlspecialchars($wp['label'], ENT_QUOTES, 'UTF-8') ?> — DB: <?= htmlspecialchars($wp['name'], ENT_QUOTES, 'UTF-8') ?> (<?= htmlspecialchars($wp['path'], ENT_QUOTES, 'UTF-8') ?>)
+                                </option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <div class="help-text" id="wpActiveHelpText" style="margin-top: 6px;">
+                        <strong>Active Site:</strong> <code><?= htmlspecialchars($config['active_wp_path'] ?? 'None', ENT_QUOTES, 'UTF-8') ?></code>
+                        | <strong>DB:</strong> <code><?= htmlspecialchars($config['db_name'] ?: 'None', ENT_QUOTES, 'UTF-8') ?></code>
+                        | <strong>Prefix:</strong> <code><?= htmlspecialchars($config['table_prefix'] ?? 'wp_', ENT_QUOTES, 'UTF-8') ?></code>
+                    </div>
+                <?php else: ?>
+                    <div style="font-size: 12px; color: #64748b; padding: 4px 0;">
+                        No <code>wp-config.php</code> detected in standard hosting paths. Upload a WordPress folder or set DB credentials via environment variables.
+                    </div>
+                <?php endif; ?>
+                </div>
+            </div>
+
+            <div id="mainProtectionBanner" class="warn" style="background: #fee2e2; border: 1.5px solid #ef4444; color: #991b1b; border-radius: 8px; padding: 12px 14px; margin-bottom: 20px; display: <?= $isMainProtected ? 'block' : 'none' ?>;">
+                <div style="display: flex; gap: 8px; align-items: flex-start;">
+                    <span style="font-size: 20px; line-height: 1;">🛡️</span>
+                    <div>
+                        <strong style="font-size: 13px;">MAIN SITE DATABASE PROTECTION IS ACTIVE</strong>
+                        <div style="font-size: 12px; margin-top: 4px; line-height: 1.45;">
+                            The active database <code><span id="bannerDbName"><?= htmlspecialchars($config['db_name']) ?></span></code> belongs to the primary WordPress installation in <code>public_html</code>.<br>
+                            To prevent accidental production data loss, <strong>Import / Restore</strong> and <strong>Live Search &amp; Replace</strong> are <strong>COMPLETELY DISABLED</strong>.<br>
+                            <em>To unlock, set <code>define('ALLOW_MAIN_SITE_OVERWRITE', true);</code> in <code>db-dump.php</code>.</em>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <?php if (!empty($config['allow_main_site_overwrite']) && !empty($config['active_wp_is_main'])): ?>
+            <div class="warn" style="background: #fffbeb; border: 1.5px solid #f59e0b; color: #b45309; border-radius: 8px; padding: 12px 14px; margin-bottom: 20px;">
+                <div style="display: flex; gap: 8px; align-items: flex-start;">
+                    <span style="font-size: 20px; line-height: 1;">⚠️</span>
+                    <div>
+                        <strong style="font-size: 13px;">CAUTION: MAIN SITE OVERWRITE UNLOCKED</strong>
+                        <div style="font-size: 12px; margin-top: 4px; line-height: 1.45;">
+                            <code>ALLOW_MAIN_SITE_OVERWRITE</code> is set to <code>true</code>. Operations will directly overwrite or alter the live production database in <code>public_html</code>.
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <?php endif; ?>
+
             <div class="warn">This file can drop tables and rewrite the database. Delete <code>db-dump.php</code>, <code>db-dump-auth.php</code>, and <code>db_exports/</code> when you are finished. On nginx, also deny HTTP access to <code>/db_exports/</code>.</div>
 
             <div class="tabs">
@@ -3799,7 +4722,9 @@ $self = htmlspecialchars(scriptName(), ENT_QUOTES, 'UTF-8');
                         Safely update WordPress serialized strings after import
                     </label>
                 </div>
-                <button type="button" id="startImportBtn" class="btn-success">Start Database Import</button>
+                <button type="button" id="startImportBtn" class="<?= $isMainProtected ? 'btn-danger' : 'btn-success' ?>" <?= $isMainProtected ? 'disabled' : '' ?>>
+                    <?= $isMainProtected ? '🔒 Import Locked (Main site in public_html protected)' : 'Start Database Import' ?>
+                </button>
             </div>
 
             <div id="replaceTab" class="tab-content">
@@ -3862,6 +4787,22 @@ $self = htmlspecialchars(scriptName(), ENT_QUOTES, 'UTF-8');
             </div>
 
             <div id="copyTab" class="tab-content">
+                <div class="input-group" style="background: #f1f5f9; padding: 12px 14px; border-radius: 8px; border: 1.5px solid #cbd5e1; margin-bottom: 20px;">
+                    <label for="copyDestSiteSelect" style="font-weight: 700; color: #1e293b; display: flex; align-items: center; gap: 6px;">
+                        <span>🔌 Load Destination from WordPress (wp-config.php)</span>
+                    </label>
+                    <select id="copyDestSiteSelect">
+                        <option value="">-- Manual Credentials / Select WordPress Config --</option>
+                        <?php foreach ($discoveredWp as $p => $wp): ?>
+                            <option value="<?= htmlspecialchars($p, ENT_QUOTES, 'UTF-8') ?>">
+                                <?= $wp['is_main_site'] ? '🛡️ ' : '📁 ' ?>
+                                <?= htmlspecialchars($wp['label'], ENT_QUOTES, 'UTF-8') ?> — DB: <?= htmlspecialchars($wp['name'], ENT_QUOTES, 'UTF-8') ?> (<?= htmlspecialchars($wp['path'], ENT_QUOTES, 'UTF-8') ?>)
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
+                    <div class="help-text" id="copyDestHelpText">Choose a discovered WordPress site to automatically load its database credentials.</div>
+                </div>
+
                 <div class="input-group">
                     <label for="destHost">Destination host</label>
                     <input type="text" id="destHost" placeholder="127.0.0.1" autocomplete="off">
@@ -3886,6 +4827,9 @@ $self = htmlspecialchars(scriptName(), ENT_QUOTES, 'UTF-8');
                         <input type="password" id="destPass" placeholder="••••••••" autocomplete="new-password">
                     </div>
                 </div>
+                <div id="copySummaryNotice" style="margin-bottom: 16px; padding: 10px 14px; background: #e0f2fe; border: 1.5px solid #38bdf8; border-radius: 8px; font-size: 13px; color: #0369a1; display: none;">
+                    <strong>Source Database:</strong> <code id="copySrcDbDisplay"><?= htmlspecialchars($config['db_name']) ?></code> ➔ <strong>Destination Database:</strong> <code id="copyDestDbDisplay">-</code>
+                </div>
                 <button type="button" id="startCopyBtn">Start Direct Copy</button>
             </div>
 
@@ -3905,8 +4849,13 @@ $self = htmlspecialchars(scriptName(), ENT_QUOTES, 'UTF-8');
 
             <script>
                 const API_URL = <?= json_encode(scriptName(), JSON_UNESCAPED_SLASHES) ?>;
-                const CSRF = <?= json_encode((string) $_SESSION['csrf_token']) ?>;
+                const CSRF = <?= json_encode((string) ($_SESSION['csrf_token'] ?? ($_COOKIE['dbdump_csrf'] ?? ''))) ?>;
                 let isRunning = false;
+                let isMainSiteProtected = <?= json_encode((bool) $isMainProtected) ?>;
+                let isAllowOverwrite = <?= json_encode((bool) isAllowMainSiteOverwrite()) ?>;
+                let activeDbName = <?= json_encode((string) $config['db_name']) ?>;
+                let activeWpLabel = <?= json_encode((string) ($config['active_wp_label'] ?? '')) ?>;
+                let discoveredSites = <?= json_encode(array_values($discoveredWp), JSON_UNESCAPED_SLASHES) ?>;
 
                 function escapeHtml(s) {
                     return String(s).replace(/[&<>"'`]/g, c => ({
@@ -4148,7 +5097,26 @@ $self = htmlspecialchars(scriptName(), ENT_QUOTES, 'UTF-8');
                         return;
                     }
 
-                    if (!confirm('WARNING: Importing ' + label + ' will execute SQL and may overwrite tables. Continue?')) return;
+                    if (isMainSiteProtected) {
+                        alert('⛔ BLOCKED: The active database (' + activeDbName + ') belongs to the main site in public_html and is protected from being overwritten.\n\nTo unlock, edit db-dump.php and set: define(\'ALLOW_MAIN_SITE_OVERWRITE\', true);');
+                        return;
+                    }
+
+                    const targetDb = activeDbName || 'the database';
+                    const confirmMessage = '⚠️ CRITICAL WARNING: DATABASE IMPORT / RESTORE\n\n'
+                        + 'You are about to IMPORT "' + label + '" into database:\n'
+                        + '👉 [' + targetDb + ']\n'
+                        + (activeWpLabel ? ('👉 Site: ' + activeWpLabel + '\n') : '')
+                        + '\nThis operation will execute SQL commands that may DROP existing tables and PERMANENTLY OVERWRITE data.\n\n'
+                        + 'Type the database name "' + targetDb + '" below to confirm and proceed:';
+
+                    const userInput = prompt(confirmMessage);
+                    if (userInput !== targetDb) {
+                        if (userInput !== null) {
+                            alert('Import canceled: Database name did not match.');
+                        }
+                        return;
+                    }
 
                     if (pickedFile) {
                         try {
@@ -4233,18 +5201,46 @@ $self = htmlspecialchars(scriptName(), ENT_QUOTES, 'UTF-8');
                     const destUser = document.getElementById('destUser').value.trim();
                     const destPass = document.getElementById('destPass').value;
                     const destPort = parseInt(document.getElementById('destPort').value, 10) || 3306;
+                    const srcDbName = activeDbName || '<?= htmlspecialchars($config['db_name']) ?>';
+
                     if (!destHost || !destName || !destUser) {
                         alert('Please fill in destination host, database name, and username');
                         return;
                     }
+
+                    if (destName === srcDbName) {
+                        alert('⛔ خطا: دیتابیس مبدأ و مقصد نمی‌توانند یکسان باشند!\n\nSource and destination databases cannot be the same (' + srcDbName + ').');
+                        return;
+                    }
+
+                    // Check if destination database belongs to protected main site
+                    const destSite = (discoveredSites || []).find(s => s.name === destName);
+                    if (destSite && destSite.is_main_site && !isAllowOverwrite) {
+                        alert('⛔ عملیات مسدود شد: دیتابیس مقصد (' + destName + ') متعلق به سایت اصلی در public_html بوده و محافظت‌شده است.\n\nCopying into the main site database in public_html is completely blocked to prevent data loss.\nTo unlock, set define(\'ALLOW_MAIN_SITE_OVERWRITE\', true); in db-dump.php');
+                        return;
+                    }
+
                     const tablesData = await apiCall('get_tables');
                     const tables = tablesData.tables || [];
-                    if (tables.length === 0) { alert('No tables found to copy'); return; }
-                    if (!confirm('Copy ' + tables.length + ' tables to ' + destName + ' on ' + destHost + '?')) return;
+
+                    const confirmCopy = '⚠️ اخطار مهم: کپی مستقیم دیتابیس (Direct DB Copy)\n\n'
+                        + '<<< از دیتابیس ' + srcDbName + ' به دیتابیس ' + destName + ' کپی خواهد شد >>>\n\n'
+                        + 'تعداد جداول مبدأ: ' + tables.length + ' جدول\n'
+                        + 'هاست مقصد: ' + destHost + ':' + destPort + '\n\n'
+                        + '⚠️ این عملیات کلیه اطلاعات و جداول موجود در دیتابیس مقصد [' + destName + '] را به کلی حذف (DROP) و بازنویسی (OVERWRITE) می‌کند!\n\n'
+                        + 'جهت تأیید، نام دیتابیس مقصد ("' + destName + '") را در کادر زیر تایپ کنید:';
+
+                    const copyInput = prompt(confirmCopy);
+                    if (copyInput !== destName) {
+                        if (copyInput !== null) {
+                            alert('کپی لغو شد: نام دیتابیس مقصد مطابقت نداشت.\nCopy canceled: Destination database name did not match.');
+                        }
+                        return;
+                    }
 
                     isRunning = true;
                     document.getElementById('startCopyBtn').disabled = true;
-                    showStatus('Starting database copy...', 'info');
+                    showStatus('Starting database copy from ' + srcDbName + ' to ' + destName + '...', 'info');
                     updateProgress(0);
                     try {
                         for (let i = 0; i < tables.length; i++) {
@@ -4266,7 +5262,7 @@ $self = htmlspecialchars(scriptName(), ENT_QUOTES, 'UTF-8');
                             dest_host: destHost, dest_port: destPort, dest_name: destName, dest_user: destUser, dest_pass: destPass
                         });
                         updateProgress(100);
-                        showStatus(fin.message || ('Database copy completed! ' + tables.length + ' tables copied.'), 'success');
+                        showStatus(fin.message || ('Database copy completed! ' + tables.length + ' tables copied from ' + srcDbName + ' to ' + destName + '.'), 'success');
                     } catch (err) {
                         showStatus('Copy error: ' + err.message, 'error');
                     } finally {
@@ -4308,9 +5304,23 @@ $self = htmlspecialchars(scriptName(), ENT_QUOTES, 'UTF-8');
                         return;
                     }
 
-                    const prefix = dryRun ? 'DRY RUN PREVIEW: Scan ' : 'CONFIRM: Search & Replace ';
-                    if (!confirm(prefix + '"' + searchOld + '" -> "' + searchNew + '" across ' + selected.length + ' table(s)?')) {
-                        return;
+                    if (!dryRun) {
+                        if (isMainSiteProtected) {
+                            alert('⛔ BLOCKED: Live Search & Replace on the main site database (' + activeDbName + ') in public_html is disabled to prevent accidental data loss.\n\nYou can run a Dry Run preview, or edit db-dump.php and set: define(\'ALLOW_MAIN_SITE_OVERWRITE\', true); to unlock.');
+                            return;
+                        }
+                        const confirmMsg = '⚠️ CAUTION: LIVE SEARCH & REPLACE\n\n'
+                            + 'Database: [' + activeDbName + ']\n'
+                            + 'Search for: "' + searchOld + '"\n'
+                            + 'Replace with: "' + searchNew + '"\n'
+                            + 'Tables: ' + selected.length + ' selected table(s)\n\n'
+                            + 'This will directly modify database records in ' + activeDbName + '. Have you taken a backup first?\n\n'
+                            + 'Click OK to execute live replacement.';
+                        if (!confirm(confirmMsg)) return;
+                    } else {
+                        if (!confirm('DRY RUN PREVIEW: Scan "' + searchOld + '" -> "' + searchNew + '" across ' + selected.length + ' table(s)?')) {
+                            return;
+                        }
                     }
 
                     isRunning = true;
@@ -4379,6 +5389,204 @@ $self = htmlspecialchars(scriptName(), ENT_QUOTES, 'UTF-8');
                     }
                     if (del) deleteFile(del.getAttribute('data-delete'));
                 });
+
+                async function handleWpSelectChange(path) {
+                    showStatus('Switching WordPress configuration to ' + path + '...', 'info');
+                    try {
+                        const res = await apiCall('switch_wp', { path });
+                        if (res.success) {
+                            activeDbName = res.site.name;
+                            activeWpLabel = res.site.label;
+                            isMainSiteProtected = res.protected;
+
+                            // Update Header Badges
+                            const dbBadge = document.getElementById('headerDbBadge');
+                            if (dbBadge) dbBadge.textContent = res.site.name || 'No DB Selected';
+
+                            let protBadge = document.getElementById('headerProtectedBadge');
+                            if (res.protected) {
+                                if (!protBadge) {
+                                    protBadge = document.createElement('span');
+                                    protBadge.id = 'headerProtectedBadge';
+                                    protBadge.className = 'badge badge-danger';
+                                    protBadge.title = 'Protected: public_html WordPress database';
+                                    protBadge.textContent = '🛡️ MAIN SITE PROTECTED';
+                                    document.querySelector('.header h1').appendChild(protBadge);
+                                }
+                            } else if (protBadge) {
+                                protBadge.remove();
+                            }
+
+                            // Update Subtitle
+                            const sub = document.getElementById('headerSubtitle');
+                            if (sub) {
+                                sub.textContent = 'Connected to ' + res.site.host + ':' + res.site.port + (res.site.label ? ' • ' + res.site.label : '');
+                            }
+
+                            // Update Help text
+                            const help = document.getElementById('wpActiveHelpText');
+                            if (help) {
+                                help.innerHTML = '<strong>Active Site:</strong> <code>' + escapeHtml(res.site.path) + '</code>'
+                                    + ' | <strong>DB:</strong> <code>' + escapeHtml(res.site.name) + '</code>';
+                            }
+
+                            // Update Protection Banner
+                            const banner = document.getElementById('mainProtectionBanner');
+                            if (banner) {
+                                banner.style.display = res.protected ? 'block' : 'none';
+                                const bannerDb = document.getElementById('bannerDbName');
+                                if (bannerDb) bannerDb.textContent = res.site.name;
+                            }
+
+                            // Update Import Button
+                            const importBtn = document.getElementById('startImportBtn');
+                            if (importBtn) {
+                                if (res.protected) {
+                                    importBtn.disabled = true;
+                                    importBtn.className = 'btn-danger';
+                                    importBtn.textContent = '🔒 Import Locked (Main site in public_html protected)';
+                                } else {
+                                    importBtn.disabled = false;
+                                    importBtn.className = 'btn-success';
+                                    importBtn.textContent = 'Start Database Import';
+                                }
+                            }
+
+                            // Update Copy Tab notice
+                            updateCopySummaryNotice();
+
+                            // Reload Tables for the new database
+                            await loadTables();
+
+                            if (res.conn_error) {
+                                showStatus('Switched to ' + res.site.name + ', but connection error: ' + res.conn_error, 'error');
+                            } else {
+                                showStatus('Switched active database to ' + res.site.name + (res.protected ? ' (Protected)' : ''), 'success');
+                            }
+                        }
+                    } catch (e) {
+                        showStatus('Failed to switch database: ' + e.message, 'error');
+                    }
+                }
+
+                function wireWpSelect() {
+                    const sel = document.getElementById('wpSiteSelect');
+                    if (sel && !sel.dataset.wired) {
+                        sel.dataset.wired = '1';
+                        sel.addEventListener('change', function() {
+                            handleWpSelectChange(this.value);
+                        });
+                    }
+                }
+
+                function updateCopySummaryNotice() {
+                    const destName = (document.getElementById('destName')?.value || '').trim();
+                    const notice = document.getElementById('copySummaryNotice');
+                    const destDisp = document.getElementById('copyDestDbDisplay');
+                    const srcDisp = document.getElementById('copySrcDbDisplay');
+                    if (srcDisp) srcDisp.textContent = activeDbName || 'None';
+                    if (!notice || !destDisp) return;
+                    if (destName) {
+                        destDisp.textContent = destName;
+                        notice.style.display = 'block';
+                    } else {
+                        notice.style.display = 'none';
+                    }
+                }
+
+                function updateCopyDestSiteOptions(sites) {
+                    const sel = document.getElementById('copyDestSiteSelect');
+                    if (!sel) return;
+                    const currVal = sel.value;
+                    let html = '<option value="">-- Manual Credentials / Select WordPress Config --</option>';
+                    (sites || []).forEach(s => {
+                        const icon = s.is_main_site ? '🛡️ ' : '📁 ';
+                        const isSel = (s.path === currVal) ? ' selected' : '';
+                        html += `<option value="${escapeHtml(s.path)}"${isSel}>${icon}${escapeHtml(s.label)} — DB: ${escapeHtml(s.name)} (${escapeHtml(s.path)})</option>`;
+                    });
+                    sel.innerHTML = html;
+                }
+
+                function wireCopyDestSiteSelect() {
+                    const copySiteSelect = document.getElementById('copyDestSiteSelect');
+                    if (copySiteSelect && !copySiteSelect.dataset.wired) {
+                        copySiteSelect.dataset.wired = '1';
+                        copySiteSelect.addEventListener('change', function() {
+                            const path = this.value;
+                            const help = document.getElementById('copyDestHelpText');
+                            if (!path) {
+                                if (help) help.textContent = 'Choose a discovered WordPress site to automatically load its database credentials.';
+                                updateCopySummaryNotice();
+                                return;
+                            }
+                            const site = (discoveredSites || []).find(s => s.path === path);
+                            if (!site) return;
+
+                            document.getElementById('destHost').value = site.host || '127.0.0.1';
+                            document.getElementById('destPort').value = site.port || 3306;
+                            document.getElementById('destName').value = site.name || '';
+                            document.getElementById('destUser').value = site.user || '';
+                            document.getElementById('destPass').value = site.pass || '';
+
+                            if (help) {
+                                if (site.is_main_site && !isAllowOverwrite) {
+                                    help.innerHTML = '<span style="color: #ef4444; font-weight: 700;">🛡️ WARNING: This is the protected main site (' + escapeHtml(site.name) + ') in public_html. Direct Copy overwrite is blocked unless ALLOW_MAIN_SITE_OVERWRITE is set to true.</span>';
+                                } else {
+                                    help.innerHTML = '<span style="color: #059669; font-weight: 600;">✓ Loaded credentials for <code>' + escapeHtml(site.name) + '</code> from <code>' + escapeHtml(site.path) + '</code></span>';
+                                }
+                            }
+                            updateCopySummaryNotice();
+                        });
+                    }
+                }
+
+                function renderWpSelector(sites, active) {
+                    discoveredSites = sites || [];
+                    updateCopyDestSiteOptions(discoveredSites);
+
+                    const container = document.getElementById('wpSitesContainer');
+                    const countSpan = document.getElementById('wpSitesCountSpan');
+                    if (countSpan) {
+                        countSpan.textContent = (sites ? sites.length : 0) + ' installation' + (sites && sites.length === 1 ? '' : 's');
+                    }
+                    if (!container) return;
+                    if (!sites || sites.length === 0) {
+                        container.innerHTML = '<div style="font-size: 12px; color: #64748b; padding: 4px 0;">No <code>wp-config.php</code> detected in standard hosting paths. Upload a WordPress folder or set DB credentials via environment variables.</div>';
+                        return;
+                    }
+                    let html = '<div style="display: flex; gap: 8px; align-items: center;"><select id="wpSiteSelect" style="flex: 1;">';
+                    sites.forEach(s => {
+                        const icon = s.is_main_site ? '🛡️ ' : '📁 ';
+                        const sel = (s.path === active) ? ' selected' : '';
+                        html += `<option value="${escapeHtml(s.path)}"${sel}>${icon}${escapeHtml(s.label)} — DB: ${escapeHtml(s.name)} (${escapeHtml(s.path)})</option>`;
+                    });
+                    html += '</select></div>';
+                    html += '<div class="help-text" id="wpActiveHelpText" style="margin-top: 6px;"></div>';
+                    container.innerHTML = html;
+                    wireWpSelect();
+                }
+
+                wireWpSelect();
+                wireCopyDestSiteSelect();
+                document.getElementById('destName')?.addEventListener('input', updateCopySummaryNotice);
+                updateCopySummaryNotice();
+
+                const rescanBtn = document.getElementById('rescanWpBtn');
+                if (rescanBtn) {
+                    rescanBtn.addEventListener('click', async function() {
+                        showStatus('Rescanning server for WordPress installations...', 'info');
+                        try {
+                            const data = await apiCall('rescan_wp');
+                            renderWpSelector(data.sites, data.active);
+                            if (data.active) {
+                                await handleWpSelectChange(data.active);
+                            }
+                            showStatus('Rescan complete: ' + (data.sites ? data.sites.length : 0) + ' WordPress site(s) found.', 'success');
+                        } catch (e) {
+                            showStatus('Rescan failed: ' + e.message, 'error');
+                        }
+                    });
+                }
 
                 loadTables();
                 loadFiles();

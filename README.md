@@ -6,15 +6,22 @@ A single-file PHP tool for **shared hosting**, **cPanel**, **DirectAdmin**, and 
 2. **Export** selected tables to `.sql.gz` or `.sql` (plus views, triggers, routines, and events when available).
 3. **Copy** tables (and views) from the current database to another MySQL/MariaDB host.
 4. **Search & replace** URLs after import, including WordPress serialized data, without breaking string lengths.
+5. **WordPress Auto-Discovery**: Automatically discovers `wp-config.php` across `/home/{cpUsername}/public_html/`, subdirectories, staging/uploaded folders, and connects to the database automatically.
+6. **Main Site Protection Lock**: Prevents accidental overwrites or live modifications to production WordPress sites located in `public_html` or `public_html/{subdir}` unless explicitly unlocked.
 
 Requires **PHP 7.4+** with `mysqli`. GZIP import/export needs `zlib`. ZIP upload needs `zip`.
 
 ---
 
-## Security (read this first)
+## Security & Safety Guardrails (read this first)
 
 This file can drop tables, rewrite a live database, and download dumps. Treat it as a temporary admin tool.
 
+- **Main Site (public_html) Lock**: Any database belonging to a WordPress installation in `public_html/wp-config.php` or `public_html/{subdir}/wp-config.php` is **strictly protected by default**. Import / table overwrite and live Search & Replace are completely disabled. To unlock, edit `db-dump.php` and set:
+  ```php
+  define('ALLOW_MAIN_SITE_OVERWRITE', true);
+  ```
+- **Mandatory Typing Confirmation & Config Selection**: Before running database imports or direct DB copies, the tool requires typing the exact target database name to prevent accidental execution. Direct DB Copy allows one-click loading of destination credentials directly from any discovered `wp-config.php`, displays a live summary, and explicitly confirms `<<<از دیتابیس X به دیتابیس Y کپی خواهد شد>>>`.
 - On first open it **refuses to run until you set a password** (stored as a hash in `db-dump-auth.php`).
 - Optional header auth: set env `DB_EXPORT_TOKEN` and send `X-Auth-Token`. There is no default token.
 - Optional hash via env: `DB_EXPORT_PASSWORD_HASH` (from `password_hash('...', PASSWORD_DEFAULT)`).
