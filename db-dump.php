@@ -309,29 +309,46 @@ function isMainSiteWpPath(string $path): bool
     $normalized = str_replace('\\', '/', $path);
     $real = str_replace('\\', '/', @realpath($path) ?: $normalized);
 
-    // 1. Matches public_html/wp-config.php or public_html/{subdir}/wp-config.php
-    if (preg_match('#(?:^|/)public_html(?:/[^/]+)?/wp-config\.php$#i', $normalized)
-        || preg_match('#(?:^|/)public_html(?:/[^/]+)?/wp-config\.php$#i', $real)) {
+    // If folder indicates staging / dev / test / demo / sandbox / uploaded, it's NOT the main site
+    $dirName = basename(dirname($normalized));
+    if (preg_match('/^(staging|stage|test|testing|dev|development|sandbox|demo|backup|uploaded|temp)/i', $dirName)
+        || preg_match('/[.](staging|test|dev|local)$/i', $dirName)) {
+        return false;
+    }
+    $realDirName = basename(dirname($real));
+    if (preg_match('/^(staging|stage|test|testing|dev|development|sandbox|demo|backup|uploaded|temp)/i', $realDirName)
+        || preg_match('/[.](staging|test|dev|local)$/i', $realDirName)) {
+        return false;
+    }
+
+    // 1. Matches public_html/wp-config.php directly
+    if (preg_match('#(?:^|/)public_html/wp-config\.php$#i', $normalized)
+        || preg_match('#(?:^|/)public_html/wp-config\.php$#i', $real)) {
         return true;
     }
 
-    // 2. Matches any path with /public_html/
-    if (strpos($normalized, '/public_html/') !== false || strpos($normalized, 'public_html/') === 0
-        || strpos($real, '/public_html/') !== false || strpos($real, 'public_html/') === 0) {
+    // Matches main site subfolder (e.g. public_html/shop/wp-config.php or public_html/en/wp-config.php)
+    if (preg_match('#(?:^|/)public_html/(?:en|fa|ar|shop|store)/wp-config\.php$#i', $normalized)
+        || preg_match('#(?:^|/)public_html/(?:en|fa|ar|shop|store)/wp-config\.php$#i', $real)) {
         return true;
     }
 
-    // 3. Matches cPanel /www/ symlink which points to public_html
-    if (preg_match('#^/home\d*/[^/]+/www(?:/|$)#i', $normalized)
-        || preg_match('#^/home\d*/[^/]+/www(?:/|$)#i', $real)) {
+    // Matches relative public_html/wp-config.php
+    if ($normalized === 'public_html/wp-config.php' || strpos($normalized, 'public_html/wp-config.php') === 0) {
         return true;
     }
 
-    // 4. Check document root if DOCUMENT_ROOT is or contains public_html
+    // 2. Matches cPanel /www/wp-config.php symlink which points directly to public_html
+    if (preg_match('#^/home\d*/[^/]+/www/wp-config\.php$#i', $normalized)
+        || preg_match('#^/home\d*/[^/]+/www/wp-config\.php$#i', $real)) {
+        return true;
+    }
+
+    // 3. Check document root if DOCUMENT_ROOT is public_html and file is directly in docRoot
     if (!empty($_SERVER['DOCUMENT_ROOT'])) {
         $docRoot = str_replace('\\', '/', @realpath($_SERVER['DOCUMENT_ROOT']) ?: $_SERVER['DOCUMENT_ROOT']);
-        if (preg_match('#(?:^|/)public_html(?:/|$)#i', $docRoot)) {
-            if ($real === $docRoot . '/wp-config.php' || strpos($real, $docRoot . '/') === 0) {
+        if (preg_match('#(?:^|/)public_html$#i', $docRoot)) {
+            if ($real === $docRoot . '/wp-config.php') {
                 return true;
             }
         }
@@ -1555,6 +1572,8 @@ function runSelfTests(): int
     $assert(isMainSiteWpPath('/home/cpuser/public_html/en/wp-config.php') === true, 'detect public_html lang subfolder');
     $assert(isMainSiteWpPath('public_html/wp-config.php') === true, 'detect relative public_html');
     $assert(isMainSiteWpPath('/home/cpuser/staging/wp-config.php') === false, 'staging site is not main site');
+    $assert(isMainSiteWpPath('/home/cpuser/public_html/staging/wp-config.php') === false, 'staging folder in public_html is not main site');
+    $assert(isMainSiteWpPath('/home/cpuser/public_html/dev/wp-config.php') === false, 'dev folder in public_html is not main site');
     $assert(isMainSiteWpPath('/home/cpuser/my_uploaded_folder/wp-config.php') === false, 'uploaded site is not main site');
     $assert(isMainSiteWpPath('/var/www/staging/wp-config.php') === false, 'var www staging is not main site');
 
@@ -2563,11 +2582,17 @@ class DatabaseImporter
     private function connect(): void
     {
         $this->db = dbConnect($this->config);
-        $this->db->query("SET SESSION FOREIGN_KEY_CHECKS = 0");
-        $this->db->query("SET SESSION UNIQUE_CHECKS = 0");
-        $this->db->query("SET SESSION SQL_MODE = 'NO_AUTO_VALUE_ON_ZERO'");
-        $this->db->query("SET SESSION max_allowed_packet = 1073741824");
-        $this->db->query("SET SESSION autocommit = 0");
+        @$this->db->query("SET SESSION FOREIGN_KEY_CHECKS = 0");
+        @$this->db->query("SET SESSION UNIQUE_CHECKS = 0");
+        @$this->db->query("SET SESSION SQL_MODE = 'NO_AUTO_VALUE_ON_ZERO'");
+        @$this->db->query("SET SESSION max_allowed_packet = 1073741824");
+        @$this->db->query("SET SESSION autocommit = 0");
+        @$this->db->query("SET SESSION sql_log_bin = 0");
+        @$this->db->query("SET SESSION bulk_insert_buffer_size = 268435456");
+        @$this->db->query("SET SESSION net_read_timeout = 3600");
+        @$this->db->query("SET SESSION net_write_timeout = 3600");
+        @$this->db->query("SET SESSION wait_timeout = 3600");
+        @$this->db->query("SET SESSION interactive_timeout = 3600");
     }
 
     public function init(array $options): array
@@ -2639,7 +2664,13 @@ class DatabaseImporter
             }
 
             $startTime = microtime(true);
-            $timeLimit = (float) $this->config['time_limit'];
+            @ini_set('memory_limit', '512M');
+            @set_time_limit(0);
+            $configuredLimit = (float) ($this->config['time_limit'] ?? 28);
+            $envLimit = (float) ini_get('max_execution_time');
+            $timeLimit = ($envLimit > 0 && $envLimit < $configuredLimit)
+                ? max(12.0, $envLimit - 4.0)
+                : max(12.0, $configuredLimit - 2.5);
 
             if (($state['phase'] ?? '') === 'prepare') {
                 $state = $this->prepareSource($state);
@@ -2688,10 +2719,11 @@ class DatabaseImporter
 
             $splitter = new SqlStatementSplitter();
             $splitter->fromState($state['parser'] ?? []);
+            $trxCount = 0;
 
             try {
                 while (!feof($fp)) {
-                    $block = fread($fp, 524288);
+                    $block = fread($fp, 2097152);
                     if ($block === false || $block === '') {
                         break;
                     }
@@ -2700,6 +2732,12 @@ class DatabaseImporter
                     foreach ($statements as $sql) {
                         if ($this->execImportSql($sql, $state)) {
                             $state['queries_count']++;
+                            $trxCount++;
+                            if ($trxCount >= 5000) {
+                                $this->db->query('COMMIT');
+                                $this->db->query('START TRANSACTION');
+                                $trxCount = 0;
+                            }
                         }
                     }
                     if ((microtime(true) - $startTime) > ($timeLimit - 2)) {
@@ -2886,9 +2924,10 @@ class DatabaseImporter
                 gzclose($in);
                 throw new RuntimeException('Could not write decompressed SQL.');
             }
-            set_time_limit(0);
+            @ini_set('memory_limit', '512M');
+            @set_time_limit(0);
             while (!gzeof($in)) {
-                $buf = gzread($in, 1048576);
+                $buf = gzread($in, 4194304);
                 if ($buf === false) {
                     fclose($out);
                     gzclose($in);
@@ -2966,8 +3005,12 @@ class DatabaseImporter
             return false;
         }
 
-        $sql = stripDefiner($sql);
-        $sql = fixSqlCollationCompatibility($sql);
+        if (stripos($sql, 'DEFINER') !== false) {
+            $sql = stripDefiner($sql);
+        }
+        if (stripos($sql, 'utf8mb4_0900') !== false) {
+            $sql = fixSqlCollationCompatibility($sql);
+        }
 
         if (($state['search_old'] ?? '') !== '' && ($state['search_new'] ?? '') !== '' && empty($state['wp_search_replace'])) {
             $sql = (new SerializedSearchReplace((string) $state['search_old'], (string) $state['search_new']))->replace($sql);
@@ -3028,7 +3071,7 @@ class DatabaseImporter
         $tables = $state['replace_tables'];
         $idx = (int) $state['replace_index'];
         $offset = (int) $state['replace_offset'];
-        $batch = 500;
+        $batch = 2500;
 
         while ($idx < count($tables)) {
             $t = $tables[$idx];
@@ -3288,7 +3331,13 @@ class DatabaseSearchReplacer
 
             $this->connect();
             $startTime = microtime(true);
-            $timeLimit = (float) $this->config['time_limit'];
+            @ini_set('memory_limit', '512M');
+            @set_time_limit(0);
+            $configuredLimit = (float) ($this->config['time_limit'] ?? 28);
+            $envLimit = (float) ini_get('max_execution_time');
+            $timeLimit = ($envLimit > 0 && $envLimit < $configuredLimit)
+                ? max(12.0, $envLimit - 4.0)
+                : max(12.0, $configuredLimit - 2.5);
 
             $old = (string) $state['search_old'];
             $new = (string) $state['search_new'];
@@ -3298,7 +3347,7 @@ class DatabaseSearchReplacer
             $tables = $state['replace_tables'];
             $idx = (int) $state['replace_index'];
             $offset = (int) $state['replace_offset'];
-            $batch = 500;
+            $batch = 2500;
             $totalTables = count($tables);
 
             $this->db->query('START TRANSACTION');
@@ -5133,13 +5182,19 @@ $self = htmlspecialchars(scriptName(), ENT_QUOTES, 'UTF-8');
                         + '👉 [' + targetDb + ']\n'
                         + (activeWpLabel ? ('👉 Site: ' + activeWpLabel + '\n') : '')
                         + '\nThis operation will execute SQL commands that may DROP existing tables and PERMANENTLY OVERWRITE data.\n\n'
-                        + 'Type the database name "' + targetDb + '" below to confirm and proceed:';
+                        + 'Type "CONFIRM" (or "' + targetDb + '") below to proceed:';
 
                     const userInput = prompt(confirmMessage);
-                    if (userInput !== targetDb) {
-                        if (userInput !== null) {
-                            alert('Import canceled: Database name did not match.');
-                        }
+                    if (userInput === null) {
+                        return;
+                    }
+                    const trimmedInput = userInput.trim();
+                    const isConfirmed = trimmedInput.toUpperCase() === 'CONFIRM'
+                        || trimmedInput.toUpperCase() === 'CONTINUE'
+                        || trimmedInput === targetDb;
+
+                    if (!isConfirmed) {
+                        alert('Import canceled: Confirmation did not match. Type CONFIRM to proceed.');
                         return;
                     }
 
@@ -5253,13 +5308,19 @@ $self = htmlspecialchars(scriptName(), ENT_QUOTES, 'UTF-8');
                         + 'تعداد جداول مبدأ: ' + tables.length + ' جدول\n'
                         + 'هاست مقصد: ' + destHost + ':' + destPort + '\n\n'
                         + '⚠️ این عملیات کلیه اطلاعات و جداول موجود در دیتابیس مقصد [' + destName + '] را به کلی حذف (DROP) و بازنویسی (OVERWRITE) می‌کند!\n\n'
-                        + 'جهت تأیید، نام دیتابیس مقصد ("' + destName + '") را در کادر زیر تایپ کنید:';
+                        + 'جهت تأیید، کلمه "CONFIRM" (یا نام دیتابیس: "' + destName + '") را در کادر زیر تایپ کنید:';
 
                     const copyInput = prompt(confirmCopy);
-                    if (copyInput !== destName) {
-                        if (copyInput !== null) {
-                            alert('کپی لغو شد: نام دیتابیس مقصد مطابقت نداشت.\nCopy canceled: Destination database name did not match.');
-                        }
+                    if (copyInput === null) {
+                        return;
+                    }
+                    const trimmedCopy = copyInput.trim();
+                    const isCopyConfirmed = trimmedCopy.toUpperCase() === 'CONFIRM'
+                        || trimmedCopy.toUpperCase() === 'CONTINUE'
+                        || trimmedCopy === destName;
+
+                    if (!isCopyConfirmed) {
+                        alert('کپی لغو شد: عبارت تأیید (CONFIRM یا نام دیتابیس) مطابقت نداشت.');
                         return;
                     }
 
@@ -5409,8 +5470,11 @@ $self = htmlspecialchars(scriptName(), ENT_QUOTES, 'UTF-8');
                     const restore = e.target.closest('[data-restore]');
                     const del = e.target.closest('[data-delete]');
                     if (restore) {
+                        const fileName = restore.getAttribute('data-restore');
                         switchTab('importTab');
-                        document.getElementById('importFileSelect').value = restore.getAttribute('data-restore');
+                        const sel = document.getElementById('importFileSelect');
+                        if (sel) sel.value = fileName;
+                        showStatus('Selected backup file: ' + fileName + '. Ready to import.', 'info');
                     }
                     if (del) deleteFile(del.getAttribute('data-delete'));
                 });
