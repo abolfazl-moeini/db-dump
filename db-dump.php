@@ -713,6 +713,68 @@ function isUserDumpName(string $name): bool
     return isAllowedDumpName($name) && $name !== 'import_work.sql';
 }
 
+function parseHttpByteRange(string $rangeHeader, int $fileSize): ?array
+{
+    if ($fileSize <= 0) {
+        return null;
+    }
+    if (!preg_match('/^bytes\s*=\s*(?:(\d+)-(\d*)|-(\d+))\z/i', trim($rangeHeader), $matches)) {
+        return null;
+    }
+    if (!empty($matches[3])) {
+        $suffix = (int) $matches[3];
+        if ($suffix <= 0) {
+            return ['error' => 416];
+        }
+        $start = max(0, $fileSize - $suffix);
+        $end = $fileSize - 1;
+    } else {
+        $start = (int) $matches[1];
+        $end = ($matches[2] !== '') ? (int) $matches[2] : ($fileSize - 1);
+    }
+
+    if ($start < 0 || $end < $start || $start >= $fileSize) {
+        return ['error' => 416];
+    }
+    if ($end >= $fileSize) {
+        $end = $fileSize - 1;
+    }
+    return ['start' => $start, 'end' => $end];
+}
+
+function streamFileChunks($file, int $start, int $length, $destStream = null): int
+{
+    @set_time_limit(0);
+    fseek($file, $start);
+    $remaining = $length;
+    $chunkSize = 256 * 1024;
+    $bytesSent = 0;
+
+    while (!feof($file) && $remaining > 0) {
+        if (connection_aborted()) {
+            break;
+        }
+        $chunk = min($chunkSize, $remaining);
+        $buf = fread($file, $chunk);
+        if ($buf === false || $buf === '') {
+            break;
+        }
+        if ($destStream !== null) {
+            fwrite($destStream, $buf);
+        } else {
+            echo $buf;
+            if (ob_get_level() > 0) {
+                @ob_flush();
+            }
+            flush();
+        }
+        $readLen = strlen($buf);
+        $bytesSent += $readLen;
+        $remaining -= $readLen;
+    }
+    return $bytesSent;
+}
+
 function stripDefiner(string $sql): string
 {
     $cleaned = preg_replace('/\s*DEFINER\s*=\s*(?:`[^`]+`|[\w\-\.]+)\s*@\s*(?:`[^`]+`|[\w\-\.%]+)/i', '', $sql);
@@ -1686,6 +1748,26 @@ function runSelfTests(): int
     $assert(formatSqlDumpValue('0', true, false) === '0', 'zero string numeric formatted as 0');
     $assert(formatSqlDumpValue("hello'world", false, false) === "'hello\\'world'", 'string value formatted and escaped');
 
+    // Test parseHttpByteRange
+    $assert(parseHttpByteRange('bytes=0-499', 1000) === ['start' => 0, 'end' => 499], 'parseHttpByteRange standard slice');
+    $assert(parseHttpByteRange('bytes=500-', 1000) === ['start' => 500, 'end' => 999], 'parseHttpByteRange open ended');
+    $assert(parseHttpByteRange('bytes=-200', 1000) === ['start' => 800, 'end' => 999], 'parseHttpByteRange suffix range');
+    $assert(parseHttpByteRange('bytes=1500-', 1000) === ['error' => 416], 'parseHttpByteRange out of bounds returns 416');
+    $assert(parseHttpByteRange('bytes=500-400', 1000) === ['error' => 416], 'parseHttpByteRange reversed slice returns 416');
+    $assert(parseHttpByteRange('not-bytes=0-10', 1000) === null, 'parseHttpByteRange ignores invalid header');
+    $assert(parseHttpByteRange('bytes=0-2000', 1000) === ['start' => 0, 'end' => 999], 'parseHttpByteRange clamps end to file size');
+
+    // Test streamFileChunks
+    $testStream = fopen('php://temp', 'w+');
+    fwrite($testStream, 'The quick brown fox jumps over the lazy dog');
+    $destStream = fopen('php://temp', 'w+');
+    $streamedLen = streamFileChunks($testStream, 4, 15, $destStream);
+    rewind($destStream);
+    $destContent = stream_get_contents($destStream);
+    $assert($streamedLen === 15 && $destContent === 'quick brown fox', 'streamFileChunks streams slice correctly');
+    fclose($testStream);
+    fclose($destStream);
+
     $_SESSION = $oldSession;
     $_COOKIE = $oldCookie;
 
@@ -2258,44 +2340,64 @@ if (isset($_GET['action']) && in_array($_GET['action'], $fileActions, true)) {
         if (!$reqFile || !isUserDumpName($reqFile) || !is_file($targetPath) || !is_readable($targetPath)) {
             jsonExit(['error' => 'File not found'], 404);
         }
+
+        if (session_status() === PHP_SESSION_ACTIVE) {
+            session_write_close();
+        }
+
+        if (function_exists('apache_setenv')) {
+            @apache_setenv('no-gzip', '1');
+        }
+        @ini_set('zlib.output_compression', 'Off');
+        while (ob_get_level() > 0) {
+            @ob_end_clean();
+        }
+
         $fileSize = (int) filesize($targetPath);
         $file = fopen($targetPath, 'rb');
         if ($file === false) {
             jsonExit(['error' => 'Cannot read file'], 500);
         }
 
-        $start = 0;
-        $end = $fileSize > 0 ? $fileSize - 1 : 0;
+        $safeName = addcslashes($reqFile, '"\\');
+        $encodedName = rawurlencode($reqFile);
 
         if ($fileSize === 0) {
             header('HTTP/1.1 200 OK');
             header('Content-Type: application/octet-stream');
-            header('Content-Disposition: attachment; filename="' . $reqFile . '"');
+            header('Content-Disposition: attachment; filename="' . $safeName . '"; filename*=UTF-8\'\'' . $encodedName);
             header('Content-Length: 0');
             header('Accept-Ranges: bytes');
-            header('Cache-Control: no-store');
+            header('Cache-Control: no-cache, no-store, must-revalidate');
+            header('Pragma: no-cache');
+            header('Expires: 0');
             header('X-Content-Type-Options: nosniff');
+            header('X-Accel-Buffering: no');
             fclose($file);
             exit;
         }
 
-        if (isset($_SERVER['HTTP_RANGE']) && preg_match('/bytes=(\d+)-(\d*)/', (string) $_SERVER['HTTP_RANGE'], $matches)) {
-            $start = (int) $matches[1];
-            if ($matches[2] !== '') {
-                $end = (int) $matches[2];
+        $start = 0;
+        $end = $fileSize - 1;
+        $isRange = false;
+
+        if (isset($_SERVER['HTTP_RANGE'])) {
+            $parsedRange = parseHttpByteRange((string) $_SERVER['HTTP_RANGE'], $fileSize);
+            if ($parsedRange !== null) {
+                if (isset($parsedRange['error']) && $parsedRange['error'] === 416) {
+                    header('HTTP/1.1 416 Range Not Satisfiable');
+                    header('Content-Range: bytes */' . $fileSize);
+                    header('X-Content-Type-Options: nosniff');
+                    fclose($file);
+                    exit;
+                }
+                $start = $parsedRange['start'];
+                $end = $parsedRange['end'];
+                $isRange = true;
             }
         }
-        if ($start < 0 || $end < $start || $start >= $fileSize) {
-            header('HTTP/1.1 416 Range Not Satisfiable');
-            header('Content-Range: bytes */' . $fileSize);
-            fclose($file);
-            exit;
-        }
-        if ($end >= $fileSize) {
-            $end = $fileSize - 1;
-        }
 
-        if ($start > 0 || $end < $fileSize - 1) {
+        if ($isRange) {
             header('HTTP/1.1 206 Partial Content');
             header('Content-Range: bytes ' . $start . '-' . $end . '/' . $fileSize);
         } else {
@@ -2303,25 +2405,18 @@ if (isset($_GET['action']) && in_array($_GET['action'], $fileActions, true)) {
         }
 
         header('Content-Type: application/octet-stream');
-        header('Content-Disposition: attachment; filename="' . $reqFile . '"');
+        header('Content-Disposition: attachment; filename="' . $safeName . '"; filename*=UTF-8\'\'' . $encodedName);
+        header('Content-Transfer-Encoding: binary');
         header('Content-Length: ' . ($end - $start + 1));
         header('Accept-Ranges: bytes');
-        header('Cache-Control: no-store');
+        header('Cache-Control: no-cache, no-store, must-revalidate');
+        header('Pragma: no-cache');
+        header('Expires: 0');
         header('X-Content-Type-Options: nosniff');
+        header('X-Accel-Buffering: no');
 
-        set_time_limit(0);
-        fseek($file, $start);
         $remaining = $end - $start + 1;
-        while (!feof($file) && $remaining > 0) {
-            $chunk = min(8192, $remaining);
-            $buf = fread($file, $chunk);
-            if ($buf === false) {
-                break;
-            }
-            echo $buf;
-            flush();
-            $remaining -= strlen($buf);
-        }
+        streamFileChunks($file, $start, $remaining);
         fclose($file);
         exit;
     }
